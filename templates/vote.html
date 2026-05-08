@@ -61,6 +61,12 @@
                 <p class="text-xs text-emerald-800 mt-0.5">Voting is locked. {% if poll.can_manage %}Use <strong>Reopen Poll</strong> above to restart voting.{% else %}Reach out to {{ get_name(poll.admin_email) }} if anything needs to change.{% endif %}</p>
             </div>
             {% endif %}
+            {% if is_closed and final_dates %}
+            <div class="mb-4 inline-flex rounded-lg border border-gray-200 bg-gray-50 p-1 text-sm">
+                <button id="tabCalendarBtn" type="button" onclick="showView('calendar')" class="px-3 py-1.5 rounded-md font-medium bg-white text-gray-900 shadow-sm">Add to calendar</button>
+                <button id="tabDatesBtn" type="button" onclick="showView('dates')" class="px-3 py-1.5 rounded-md font-medium text-gray-600 hover:text-gray-900">Dates &amp; votes</button>
+            </div>
+            {% endif %}
             {% if not user_email and not is_closed %}
             <div class="mb-4 p-4 rounded-lg bg-indigo-50 border border-indigo-100 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
                 <div>
@@ -72,6 +78,98 @@
                 </a>
             </div>
             {% endif %}
+            {% if is_closed and final_dates %}
+            <div id="view-calendar">
+                <h3 class="text-sm font-semibold text-gray-900 mb-3">Add to calendar</h3>
+                <p class="text-xs text-gray-500 mb-3">Confirmed date{{ 's' if final_dates|length > 1 else '' }} below. Each row has its own .ics file, an option to email invites to everyone who voted, and an AI Assistant prompt for organizers who'd rather use a chatbot with calendar access.</p>
+                <div class="space-y-3">
+                    {% for d in final_dates %}
+                    {% set is_timed = d.start_time and d.end_time %}
+                    <div class="border border-emerald-200 rounded-lg p-3 bg-white" data-event-row data-date-id="{{ d.id }}">
+                        <div class="flex items-center justify-between gap-3 flex-wrap">
+                            <div>
+                                <div class="font-medium text-gray-900">{{ d.date }}</div>
+                                <div class="text-xs text-gray-500" data-event-label>
+                                    {% if is_timed %}{{ d.start_time }}–{{ d.end_time }} (your local time){% else %}All-day event{% endif %}
+                                </div>
+                            </div>
+                            <div class="flex flex-wrap gap-2">
+                                <a
+                                    href="/poll/{{ poll.id }}/event/{{ d.id }}.ics"
+                                    class="text-xs bg-gray-100 text-gray-700 py-2 px-3 rounded-lg hover:bg-gray-200 transition-colors"
+                                >
+                                    Download .ics
+                                </a>
+                                {% if poll.can_manage %}
+                                <button
+                                    type="button"
+                                    onclick="emailInvites({{ d.id }}, this)"
+                                    class="text-xs bg-emerald-600 text-white py-2 px-3 rounded-lg hover:bg-emerald-700 transition-colors"
+                                >
+                                    Email invites to voters
+                                </button>
+                                {% endif %}
+                            </div>
+                        </div>
+                        {% if poll.can_manage %}
+                        <div class="mt-3 pt-3 border-t border-gray-100 flex flex-wrap items-center gap-3">
+                            <label class="flex items-center gap-2 text-xs text-gray-700 cursor-pointer">
+                                <input
+                                    type="checkbox"
+                                    data-allday-toggle
+                                    {% if not is_timed %}checked{% endif %}
+                                    onchange="onAllDayToggle({{ d.id }})"
+                                    class="rounded text-indigo-600"
+                                >
+                                All-day event
+                            </label>
+                            <div data-time-fields class="flex items-center gap-2 {% if not is_timed %}hidden{% endif %}">
+                                <label class="text-xs text-gray-500">Start</label>
+                                <input
+                                    type="time"
+                                    data-start-time
+                                    value="{{ d.start_time or '' }}"
+                                    onchange="saveEventTime({{ d.id }})"
+                                    class="text-xs border border-gray-300 rounded px-2 py-1"
+                                >
+                                <label class="text-xs text-gray-500">End</label>
+                                <input
+                                    type="time"
+                                    data-end-time
+                                    value="{{ d.end_time or '' }}"
+                                    onchange="saveEventTime({{ d.id }})"
+                                    class="text-xs border border-gray-300 rounded px-2 py-1"
+                                >
+                            </div>
+                            <span data-time-status class="text-xs text-gray-400 ml-auto"></span>
+                        </div>
+                        {% endif %}
+                    </div>
+                    {% endfor %}
+                </div>
+
+                {% if poll.can_manage and ai_prompt %}
+                <div class="mt-4 border border-indigo-200 rounded-lg p-3 bg-indigo-50/50">
+                    <div class="flex items-center justify-between gap-3 flex-wrap mb-2">
+                        <div>
+                            <div class="text-sm font-medium text-gray-900">AI Assistant prompt</div>
+                            <div class="text-xs text-gray-600">Copy and paste into a chatbot with calendar access (e.g. ChatGPT, Claude with Google Calendar) — it'll create the events and invite everyone for you.</div>
+                        </div>
+                        <button
+                            type="button"
+                            onclick="copyAiPrompt(this)"
+                            class="text-xs bg-indigo-600 text-white py-2 px-3 rounded-lg hover:bg-indigo-700 transition-colors whitespace-nowrap"
+                        >
+                            Copy prompt
+                        </button>
+                    </div>
+                    <pre id="ai-prompt-text" class="text-xs bg-white border border-gray-200 rounded-lg p-3 whitespace-pre-wrap text-gray-700 max-h-48 overflow-auto">{{ ai_prompt }}</pre>
+                </div>
+                {% endif %}
+            </div>
+            {% endif %}
+
+            <div id="view-dates" {% if is_closed and final_dates %}class="hidden"{% endif %}>
             <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
                 <div class="flex gap-4 text-xs text-gray-500">
                     <span class="flex items-center gap-1.5">
@@ -218,97 +316,7 @@
                 </div>
                 {% endfor %}
             </div>
-
-            {% if is_closed and final_dates %}
-            <div class="mt-6 pt-4 border-t border-gray-100">
-                <h3 class="text-sm font-semibold text-gray-900 mb-3">Add to calendar</h3>
-                <p class="text-xs text-gray-500 mb-3">Confirmed date{{ 's' if final_dates|length > 1 else '' }} below. Each row has its own .ics file, an option to email invites to everyone who voted, and an AI Assistant prompt for organizers who'd rather use a chatbot with calendar access.</p>
-                <div class="space-y-3">
-                    {% for d in final_dates %}
-                    {% set is_timed = d.start_time and d.end_time %}
-                    <div class="border border-emerald-200 rounded-lg p-3 bg-white" data-event-row data-date-id="{{ d.id }}">
-                        <div class="flex items-center justify-between gap-3 flex-wrap">
-                            <div>
-                                <div class="font-medium text-gray-900">{{ d.date }}</div>
-                                <div class="text-xs text-gray-500" data-event-label>
-                                    {% if is_timed %}{{ d.start_time }}–{{ d.end_time }} (your local time){% else %}All-day event{% endif %}
-                                </div>
-                            </div>
-                            <div class="flex flex-wrap gap-2">
-                                <a
-                                    href="/poll/{{ poll.id }}/event/{{ d.id }}.ics"
-                                    class="text-xs bg-gray-100 text-gray-700 py-2 px-3 rounded-lg hover:bg-gray-200 transition-colors"
-                                >
-                                    Download .ics
-                                </a>
-                                {% if poll.can_manage %}
-                                <button
-                                    type="button"
-                                    onclick="emailInvites({{ d.id }}, this)"
-                                    class="text-xs bg-emerald-600 text-white py-2 px-3 rounded-lg hover:bg-emerald-700 transition-colors"
-                                >
-                                    Email invites to voters
-                                </button>
-                                {% endif %}
-                            </div>
-                        </div>
-                        {% if poll.can_manage %}
-                        <div class="mt-3 pt-3 border-t border-gray-100 flex flex-wrap items-center gap-3">
-                            <label class="flex items-center gap-2 text-xs text-gray-700 cursor-pointer">
-                                <input
-                                    type="checkbox"
-                                    data-allday-toggle
-                                    {% if not is_timed %}checked{% endif %}
-                                    onchange="onAllDayToggle({{ d.id }})"
-                                    class="rounded text-indigo-600"
-                                >
-                                All-day event
-                            </label>
-                            <div data-time-fields class="flex items-center gap-2 {% if not is_timed %}hidden{% endif %}">
-                                <label class="text-xs text-gray-500">Start</label>
-                                <input
-                                    type="time"
-                                    data-start-time
-                                    value="{{ d.start_time or '' }}"
-                                    onchange="saveEventTime({{ d.id }})"
-                                    class="text-xs border border-gray-300 rounded px-2 py-1"
-                                >
-                                <label class="text-xs text-gray-500">End</label>
-                                <input
-                                    type="time"
-                                    data-end-time
-                                    value="{{ d.end_time or '' }}"
-                                    onchange="saveEventTime({{ d.id }})"
-                                    class="text-xs border border-gray-300 rounded px-2 py-1"
-                                >
-                            </div>
-                            <span data-time-status class="text-xs text-gray-400 ml-auto"></span>
-                        </div>
-                        {% endif %}
-                    </div>
-                    {% endfor %}
-                </div>
-
-                {% if poll.can_manage and ai_prompt %}
-                <div class="mt-4 border border-indigo-200 rounded-lg p-3 bg-indigo-50/50">
-                    <div class="flex items-center justify-between gap-3 flex-wrap mb-2">
-                        <div>
-                            <div class="text-sm font-medium text-gray-900">AI Assistant prompt</div>
-                            <div class="text-xs text-gray-600">Copy and paste into a chatbot with calendar access (e.g. ChatGPT, Claude with Google Calendar) — it'll create the events and invite everyone for you.</div>
-                        </div>
-                        <button
-                            type="button"
-                            onclick="copyAiPrompt(this)"
-                            class="text-xs bg-indigo-600 text-white py-2 px-3 rounded-lg hover:bg-indigo-700 transition-colors whitespace-nowrap"
-                        >
-                            Copy prompt
-                        </button>
-                    </div>
-                    <pre id="ai-prompt-text" class="text-xs bg-white border border-gray-200 rounded-lg p-3 whitespace-pre-wrap text-gray-700 max-h-48 overflow-auto">{{ ai_prompt }}</pre>
-                </div>
-                {% endif %}
             </div>
-            {% endif %}
 
             {% if participants|length > 0 %}
             <div class="mt-6 pt-4 border-t border-gray-100">
@@ -569,6 +577,28 @@
             btn.textContent = 'Copied!';
             setTimeout(() => { btn.textContent = original; }, 2000);
         }).catch(() => alert('Could not copy. Select the text and copy manually.'));
+    }
+
+    function showView(view) {
+        const calendar = document.getElementById('view-calendar');
+        const dates = document.getElementById('view-dates');
+        const calBtn = document.getElementById('tabCalendarBtn');
+        const datesBtn = document.getElementById('tabDatesBtn');
+        if (!calendar || !dates) return;
+        const activeCls = 'px-3 py-1.5 rounded-md font-medium bg-white text-gray-900 shadow-sm';
+        const idleCls   = 'px-3 py-1.5 rounded-md font-medium text-gray-600 hover:text-gray-900';
+        if (view === 'calendar') {
+            calendar.classList.remove('hidden');
+            dates.classList.add('hidden');
+            calBtn.className = activeCls;
+            datesBtn.className = idleCls;
+        } else {
+            calendar.classList.add('hidden');
+            dates.classList.remove('hidden');
+            calBtn.className = idleCls;
+            datesBtn.className = activeCls;
+        }
+        window.scrollTo({ top: 0, behavior: 'smooth' });
     }
 
     function eventRow(dateId) {
