@@ -175,10 +175,14 @@ def generate_ics(poll, date_row, attendees, organizer_email, organizer_name, sen
 
     Times are sourced from poll.event_start_time / poll.event_end_time
     (HH:MM). When both are set, emits a timed floating-time event;
-    otherwise an all-day event. ``sent_by_email`` (when given and
-    different from organizer_email) is added as a SENT-BY parameter on
-    ORGANIZER so Gmail accepts the invite even though the From:
-    domain doesn't match the organizer's mailbox.
+    otherwise an all-day event.
+
+    When ``sent_by_email`` is given and differs from organizer_email
+    (the email-invites path), the calendar ORGANIZER is set to the
+    actual sending address — this is the only thing Gmail consistently
+    accepts; SENT-BY alone gets rejected as spoofed for personal Gmail
+    organizers. The poll creator stays in the ATTENDEE list and is
+    surfaced via DESCRIPTION + the email's Reply-To header.
     """
     parts = [int(p) for p in date_row["date"].split("-")]
     day = _date(parts[0], parts[1], parts[2])
@@ -205,10 +209,24 @@ def generate_ics(poll, date_row, attendees, organizer_email, organizer_name, sen
             f"DTEND;VALUE=DATE:{end_day.strftime('%Y%m%d')}",
         ]
 
-    organizer_params = [f"CN={_ics_escape(organizer_name or organizer_email)}"]
-    if sent_by_email and normalize_email(sent_by_email) != normalize_email(organizer_email):
-        organizer_params.append(f'SENT-BY="mailto:{sent_by_email}"')
-    organizer_line = f"ORGANIZER;{';'.join(organizer_params)}:mailto:{organizer_email}"
+    is_delegated_invite = bool(
+        sent_by_email and normalize_email(sent_by_email) != normalize_email(organizer_email)
+    )
+    if is_delegated_invite:
+        cal_organizer_email = sent_by_email
+        cal_organizer_name = "Templo"
+        description_text = (
+            f"Confirmed by {organizer_name or organizer_email} via Templo. "
+            f"{poll.get('name') or ''}"
+        )
+    else:
+        cal_organizer_email = organizer_email
+        cal_organizer_name = organizer_name or organizer_email
+        description_text = "Confirmed via Templo. " + (poll.get('name') or '')
+
+    organizer_line = (
+        f"ORGANIZER;CN={_ics_escape(cal_organizer_name)}:mailto:{cal_organizer_email}"
+    )
 
     lines = [
         "BEGIN:VCALENDAR",
@@ -224,7 +242,7 @@ def generate_ics(poll, date_row, attendees, organizer_email, organizer_name, sen
         f"TRANSP:OPAQUE",
         *dt_lines,
         f"SUMMARY:{_ics_escape(poll.get('name'))}",
-        f"DESCRIPTION:{_ics_escape('Confirmed via Templo. ' + (poll.get('name') or ''))}",
+        f"DESCRIPTION:{_ics_escape(description_text)}",
         organizer_line,
     ]
     for attendee in attendees:
