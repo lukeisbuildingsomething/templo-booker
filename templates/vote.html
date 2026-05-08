@@ -225,11 +225,14 @@
                 <p class="text-xs text-gray-500 mb-3">Confirmed date{{ 's' if final_dates|length > 1 else '' }} below. Each row has its own .ics file, an option to email invites to everyone who voted, and an AI Assistant prompt for organizers who'd rather use a chatbot with calendar access.</p>
                 <div class="space-y-3">
                     {% for d in final_dates %}
-                    <div class="border border-emerald-200 rounded-lg p-3 bg-white">
+                    {% set is_timed = d.start_time and d.end_time %}
+                    <div class="border border-emerald-200 rounded-lg p-3 bg-white" data-event-row data-date-id="{{ d.id }}">
                         <div class="flex items-center justify-between gap-3 flex-wrap">
                             <div>
                                 <div class="font-medium text-gray-900">{{ d.date }}</div>
-                                <div class="text-xs text-gray-500">All-day event</div>
+                                <div class="text-xs text-gray-500" data-event-label>
+                                    {% if is_timed %}{{ d.start_time }}–{{ d.end_time }} (your local time){% else %}All-day event{% endif %}
+                                </div>
                             </div>
                             <div class="flex flex-wrap gap-2">
                                 <a
@@ -249,6 +252,39 @@
                                 {% endif %}
                             </div>
                         </div>
+                        {% if poll.can_manage %}
+                        <div class="mt-3 pt-3 border-t border-gray-100 flex flex-wrap items-center gap-3">
+                            <label class="flex items-center gap-2 text-xs text-gray-700 cursor-pointer">
+                                <input
+                                    type="checkbox"
+                                    data-allday-toggle
+                                    {% if not is_timed %}checked{% endif %}
+                                    onchange="onAllDayToggle({{ d.id }})"
+                                    class="rounded text-indigo-600"
+                                >
+                                All-day event
+                            </label>
+                            <div data-time-fields class="flex items-center gap-2 {% if not is_timed %}hidden{% endif %}">
+                                <label class="text-xs text-gray-500">Start</label>
+                                <input
+                                    type="time"
+                                    data-start-time
+                                    value="{{ d.start_time or '' }}"
+                                    onchange="saveEventTime({{ d.id }})"
+                                    class="text-xs border border-gray-300 rounded px-2 py-1"
+                                >
+                                <label class="text-xs text-gray-500">End</label>
+                                <input
+                                    type="time"
+                                    data-end-time
+                                    value="{{ d.end_time or '' }}"
+                                    onchange="saveEventTime({{ d.id }})"
+                                    class="text-xs border border-gray-300 rounded px-2 py-1"
+                                >
+                            </div>
+                            <span data-time-status class="text-xs text-gray-400 ml-auto"></span>
+                        </div>
+                        {% endif %}
                     </div>
                     {% endfor %}
                 </div>
@@ -533,6 +569,70 @@
             btn.textContent = 'Copied!';
             setTimeout(() => { btn.textContent = original; }, 2000);
         }).catch(() => alert('Could not copy. Select the text and copy manually.'));
+    }
+
+    function eventRow(dateId) {
+        return document.querySelector(`[data-event-row][data-date-id="${dateId}"]`);
+    }
+
+    function onAllDayToggle(dateId) {
+        const row = eventRow(dateId);
+        if (!row) return;
+        const allDay = row.querySelector('[data-allday-toggle]').checked;
+        row.querySelector('[data-time-fields]').classList.toggle('hidden', allDay);
+        if (allDay) {
+            saveEventTime(dateId);
+        } else {
+            // Default to 09:00–10:00 if empty so the user has something to tweak
+            const startEl = row.querySelector('[data-start-time]');
+            const endEl = row.querySelector('[data-end-time]');
+            if (!startEl.value) startEl.value = '09:00';
+            if (!endEl.value) endEl.value = '10:00';
+            saveEventTime(dateId);
+        }
+    }
+
+    async function saveEventTime(dateId) {
+        const row = eventRow(dateId);
+        if (!row) return;
+        const allDay = row.querySelector('[data-allday-toggle]').checked;
+        const start = row.querySelector('[data-start-time]').value;
+        const end = row.querySelector('[data-end-time]').value;
+        const status = row.querySelector('[data-time-status]');
+        status.textContent = 'Saving…';
+        status.className = 'text-xs text-gray-400 ml-auto';
+
+        const body = allDay
+            ? { all_day: true }
+            : { all_day: false, start_time: start, end_time: end };
+
+        try {
+            const res = await fetch(`/poll/{{ poll.id }}/event/${dateId}/time`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || data.error) {
+                status.textContent = data.error || 'Save failed';
+                status.className = 'text-xs text-red-600 ml-auto';
+                return;
+            }
+            const labelEl = row.querySelector('[data-event-label]');
+            if (labelEl) {
+                labelEl.textContent = allDay
+                    ? 'All-day event'
+                    : `${data.start_time}–${data.end_time} (your local time)`;
+            }
+            const aiEl = document.getElementById('ai-prompt-text');
+            if (aiEl && data.ai_prompt) aiEl.textContent = data.ai_prompt;
+            status.textContent = 'Saved';
+            status.className = 'text-xs text-emerald-600 ml-auto';
+            setTimeout(() => { if (status.textContent === 'Saved') status.textContent = ''; }, 1500);
+        } catch (e) {
+            status.textContent = 'Network error';
+            status.className = 'text-xs text-red-600 ml-auto';
+        }
     }
 </script>
 
