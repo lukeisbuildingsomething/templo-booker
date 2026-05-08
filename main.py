@@ -170,12 +170,15 @@ def event_time_label(poll, date_row):
     return f"{date_str} (all day)"
 
 
-def generate_ics(poll, date_row, attendees, organizer_email, organizer_name):
+def generate_ics(poll, date_row, attendees, organizer_email, organizer_name, sent_by_email=None):
     """Build an RFC 5545 VCALENDAR string for a date row.
 
     Times are sourced from poll.event_start_time / poll.event_end_time
     (HH:MM). When both are set, emits a timed floating-time event;
-    otherwise an all-day event.
+    otherwise an all-day event. ``sent_by_email`` (when given and
+    different from organizer_email) is added as a SENT-BY parameter on
+    ORGANIZER so Gmail accepts the invite even though the From:
+    domain doesn't match the organizer's mailbox.
     """
     parts = [int(p) for p in date_row["date"].split("-")]
     day = _date(parts[0], parts[1], parts[2])
@@ -202,6 +205,11 @@ def generate_ics(poll, date_row, attendees, organizer_email, organizer_name):
             f"DTEND;VALUE=DATE:{end_day.strftime('%Y%m%d')}",
         ]
 
+    organizer_params = [f"CN={_ics_escape(organizer_name or organizer_email)}"]
+    if sent_by_email and normalize_email(sent_by_email) != normalize_email(organizer_email):
+        organizer_params.append(f'SENT-BY="mailto:{sent_by_email}"')
+    organizer_line = f"ORGANIZER;{';'.join(organizer_params)}:mailto:{organizer_email}"
+
     lines = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
@@ -211,10 +219,13 @@ def generate_ics(poll, date_row, attendees, organizer_email, organizer_name):
         "BEGIN:VEVENT",
         f"UID:{uid}",
         f"DTSTAMP:{dtstamp}",
+        f"SEQUENCE:0",
+        f"STATUS:CONFIRMED",
+        f"TRANSP:OPAQUE",
         *dt_lines,
         f"SUMMARY:{_ics_escape(poll.get('name'))}",
         f"DESCRIPTION:{_ics_escape('Confirmed via Templo. ' + (poll.get('name') or ''))}",
-        f"ORGANIZER;CN={_ics_escape(organizer_name or organizer_email)}:mailto:{organizer_email}",
+        organizer_line,
     ]
     for attendee in attendees:
         if not attendee:
@@ -1485,7 +1496,8 @@ def download_event_ics(poll_id, date_id):
     organizer_name = get_name(organizer_email) or organizer_email
     conn.close()
 
-    ics = generate_ics(poll, date_row, attendees, organizer_email, organizer_name)
+    _, sender_email = get_mail_from()
+    ics = generate_ics(poll, date_row, attendees, organizer_email, organizer_name, sent_by_email=sender_email)
     filename = f"templo-{poll['id']}-{date_row['date']}.ics"
     response = app.make_response(ics)
     response.headers["Content-Type"] = "text/calendar; charset=utf-8"
@@ -1530,7 +1542,8 @@ def email_event_invites(poll_id, date_id):
     if not attendees:
         return jsonify({"error": "No participants have voted yet — no one to invite."}), 400
 
-    ics = generate_ics(poll, date_row, attendees, organizer_email, organizer_name)
+    _, sender_email = get_mail_from()
+    ics = generate_ics(poll, date_row, attendees, organizer_email, organizer_name, sent_by_email=sender_email)
     attachment = {
         "content": base64.b64encode(ics.encode("utf-8")).decode("ascii"),
         "filename": f"templo-{poll['id']}-{date_row['date']}.ics",
