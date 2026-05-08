@@ -1,3 +1,4 @@
+import base64
 import os
 import random
 import re
@@ -8,7 +9,7 @@ import psycopg2
 import requests
 from dotenv import load_dotenv
 from psycopg2.extras import RealDictCursor
-from datetime import datetime, timedelta
+from datetime import date as _date, datetime, timedelta
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify, flash
 from werkzeug.utils import secure_filename
 
@@ -61,7 +62,7 @@ def get_mail_from():
     return name, email
 
 
-def send_email(to_email, subject, html_body, reply_to=None):
+def send_email(to_email, subject, html_body, reply_to=None, attachments=None):
     api_key = get_setting("mailersend_api_key")
     if not api_key:
         msg = "MailerSend API key not configured (set it in Admin → Email)"
@@ -77,6 +78,8 @@ def send_email(to_email, subject, html_body, reply_to=None):
     }
     if reply_to:
         payload["reply_to"] = {"email": reply_to}
+    if attachments:
+        payload["attachments"] = attachments
 
     try:
         response = requests.post(
@@ -133,6 +136,76 @@ def classify_email_error(error):
 def email_error_flash(error, fallback_action="Please try again in a minute."):
     code, msg = classify_email_error(error)
     return f"We couldn't send your sign-in email ({code}). {msg} {fallback_action}".strip()
+
+
+def _ics_escape(value):
+    if value is None:
+        return ""
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+        .replace("\r\n", "\\n")
+        .replace("\n", "\\n")
+    )
+
+
+def generate_ics(poll, date_row, attendees, organizer_email, organizer_name):
+    """Build an RFC 5545 VCALENDAR string for a single all-day event."""
+    parts = [int(p) for p in date_row["date"].split("-")]
+    start = _date(parts[0], parts[1], parts[2])
+    end = start + timedelta(days=1)
+    dtstamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    uid = f"{poll['id']}-{date_row['id']}@templobooker.com"
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Templo//Poll//EN",
+        "METHOD:REQUEST",
+        "CALSCALE:GREGORIAN",
+        "BEGIN:VEVENT",
+        f"UID:{uid}",
+        f"DTSTAMP:{dtstamp}",
+        f"DTSTART;VALUE=DATE:{start.strftime('%Y%m%d')}",
+        f"DTEND;VALUE=DATE:{end.strftime('%Y%m%d')}",
+        f"SUMMARY:{_ics_escape(poll.get('name'))}",
+        f"DESCRIPTION:{_ics_escape('Confirmed via Templo. ' + (poll.get('name') or ''))}",
+        f"ORGANIZER;CN={_ics_escape(organizer_name or organizer_email)}:mailto:{organizer_email}",
+    ]
+    for attendee in attendees:
+        if not attendee:
+            continue
+        cn = _ics_escape(get_name(attendee) or attendee)
+        lines.append(
+            f"ATTENDEE;CN={cn};RSVP=TRUE;PARTSTAT=NEEDS-ACTION;ROLE=REQ-PARTICIPANT:mailto:{attendee}"
+        )
+    lines.append("END:VEVENT")
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(lines) + "\r\n"
+
+
+def build_ai_calendar_prompt(poll, final_dates, attendees, organizer_email):
+    """Markdown the organizer can paste into a chatbot with calendar tools."""
+    lines = [
+        f"# Calendar invites for: {poll.get('name')}",
+        "",
+        "Please create the following all-day event(s) on my calendar and send invites to every attendee listed.",
+        "",
+        f"**Organizer:** {organizer_email}",
+        "",
+        "**Attendees:**",
+    ]
+    for attendee in attendees:
+        if attendee:
+            lines.append(f"- {attendee}")
+    lines.append("")
+    lines.append("**Events:**")
+    for d in final_dates:
+        lines.append(f"- {d['date']} (all day) — *{poll.get('name')}*")
+    lines.append("")
+    lines.append("Use my default calendar. Send invitations so each attendee can RSVP.")
+    return "\n".join(lines)
 
 
 def check_mailersend_status(api_key=None):
@@ -491,6 +564,8 @@ def init_db():
     try:
         cursor.execute("ALTER TABLE polls ADD COLUMN IF NOT EXISTS access_mode TEXT DEFAULT 'public_link'")
         cursor.execute("ALTER TABLE polls ADD COLUMN IF NOT EXISTS slug TEXT")
+        cursor.execute("ALTER TABLE polls ADD COLUMN IF NOT EXISTS closed_at TIMESTAMP")
+        cursor.execute("ALTER TABLE polls ADD COLUMN IF NOT EXISTS closed_by TEXT")
         cursor.execute("UPDATE polls SET access_mode = 'public_link' WHERE access_mode IS NULL")
         cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS polls_slug_unique ON polls(slug) WHERE slug IS NOT NULL")
     except Exception as e:
@@ -503,6 +578,11 @@ def init_db():
             date TEXT NOT NULL
         )
     ''')
+
+    try:
+        cursor.execute("ALTER TABLE dates ADD COLUMN IF NOT EXISTS is_final BOOLEAN DEFAULT FALSE")
+    except Exception as e:
+        print(f"WARNING: dates migration: {e}")
     
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS votes (
@@ -1012,15 +1092,27 @@ def view_poll(poll_id):
     best_dates = [d_id for d_id, count in yes_counts.items() if count == max_yes and max_yes > 0]
 
     poll["can_manage"] = user_can_manage_poll(current_user, poll)
+    is_closed = bool(poll.get("closed_at"))
+    final_dates = [d for d in dates if d.get("is_final")]
+    sorted_participants = sorted(participants)
+
+    ai_prompt = ""
+    if is_closed and final_dates:
+        ai_prompt = build_ai_calendar_prompt(
+            poll, final_dates, sorted_participants, normalize_email(poll.get("admin_email"))
+        )
 
     return render_template(
         "vote.html",
         poll=poll,
         dates=dates,
         votes_dict=votes_dict,
-        participants=sorted(participants),
+        participants=sorted_participants,
         user_email=current_user["email"] if current_user else None,
-        best_dates=best_dates
+        best_dates=best_dates,
+        is_closed=is_closed,
+        final_dates=final_dates,
+        ai_prompt=ai_prompt,
     )
 
 
@@ -1161,6 +1253,213 @@ def delete_poll(poll_id):
     return redirect(url_for("dashboard"))
 
 
+def _participant_emails(cursor, poll_id):
+    cursor.execute(
+        '''SELECT DISTINCT user_email FROM votes v
+           JOIN dates d ON v.date_id = d.id
+           WHERE d.poll_id = %s''',
+        (poll_id,)
+    )
+    return sorted({normalize_email(r["user_email"]) for r in cursor.fetchall() if r["user_email"]})
+
+
+@app.route("/poll/<poll_id>/close", methods=["POST"])
+def close_poll(poll_id):
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({"error": "Please sign in.", "needs_login": True}), 401
+
+    data = request.get_json(silent=True) or {}
+    raw_ids = data.get("date_ids") or []
+    try:
+        date_ids = [int(x) for x in raw_ids]
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid date IDs."}), 400
+    if not date_ids:
+        return jsonify({"error": "Pick at least one final date."}), 400
+
+    conn = get_db()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute("SELECT * FROM polls WHERE id = %s", (poll_id,))
+    poll = cursor.fetchone()
+    if not poll:
+        conn.close()
+        return jsonify({"error": "Poll not found."}), 404
+    if not user_can_manage_poll(current_user, poll):
+        conn.close()
+        return jsonify({"error": "Only the poll organizer can close this poll."}), 403
+
+    cursor.execute("SELECT id FROM dates WHERE poll_id = %s", (poll_id,))
+    valid_ids = {r["id"] for r in cursor.fetchall()}
+    final_ids = [d for d in date_ids if d in valid_ids]
+    if not final_ids:
+        conn.close()
+        return jsonify({"error": "None of the selected dates belong to this poll."}), 400
+
+    cursor.execute("UPDATE dates SET is_final = FALSE WHERE poll_id = %s", (poll_id,))
+    cursor.execute(
+        "UPDATE dates SET is_final = TRUE WHERE poll_id = %s AND id = ANY(%s)",
+        (poll_id, final_ids)
+    )
+    cursor.execute(
+        "UPDATE polls SET closed_at = NOW(), closed_by = %s WHERE id = %s",
+        (current_user["email"], poll_id)
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/poll/<poll_id>/reopen", methods=["POST"])
+def reopen_poll(poll_id):
+    current_user = get_current_user()
+    if not current_user:
+        flash("Please sign in.", "error")
+        return redirect(url_for("login"))
+
+    conn = get_db()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute("SELECT * FROM polls WHERE id = %s", (poll_id,))
+    poll = cursor.fetchone()
+    if not poll:
+        conn.close()
+        flash("Poll not found.", "error")
+        return redirect(url_for("dashboard"))
+    if not user_can_manage_poll(current_user, poll):
+        conn.close()
+        flash("Only the poll organizer can reopen this poll.", "error")
+        return redirect(url_for("view_poll", poll_id=poll_id))
+
+    cursor.execute("UPDATE dates SET is_final = FALSE WHERE poll_id = %s", (poll_id,))
+    cursor.execute("UPDATE polls SET closed_at = NULL, closed_by = NULL WHERE id = %s", (poll_id,))
+    conn.commit()
+    conn.close()
+    flash("Poll reopened — voting is live again.", "success")
+    return redirect(url_for("view_poll", poll_id=poll_id))
+
+
+@app.route("/poll/<poll_id>/event/<int:date_id>.ics")
+def download_event_ics(poll_id, date_id):
+    current_user = get_current_user()
+    conn = get_db()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute("SELECT * FROM polls WHERE id = %s", (poll_id,))
+    poll = cursor.fetchone()
+    if not poll or not poll.get("closed_at"):
+        conn.close()
+        flash("Calendar invites are only available for closed polls.", "error")
+        return redirect(url_for("view_poll", poll_id=poll_id))
+    if not can_view_poll(current_user, poll):
+        conn.close()
+        flash("You don't have access to this poll.", "error")
+        return redirect(url_for("home"))
+
+    cursor.execute(
+        "SELECT * FROM dates WHERE id = %s AND poll_id = %s AND is_final = TRUE",
+        (date_id, poll_id)
+    )
+    date_row = cursor.fetchone()
+    if not date_row:
+        conn.close()
+        flash("That date isn't a confirmed date for this poll.", "error")
+        return redirect(url_for("view_poll", poll_id=poll_id))
+
+    attendees = _participant_emails(cursor, poll_id)
+    organizer_email = normalize_email(poll.get("admin_email"))
+    organizer_name = get_name(organizer_email) or organizer_email
+    conn.close()
+
+    ics = generate_ics(poll, date_row, attendees, organizer_email, organizer_name)
+    filename = f"templo-{poll['id']}-{date_row['date']}.ics"
+    response = app.make_response(ics)
+    response.headers["Content-Type"] = "text/calendar; charset=utf-8"
+    response.headers["Content-Disposition"] = f"attachment; filename={filename}"
+    return response
+
+
+@app.route("/poll/<poll_id>/event/<int:date_id>/email-invites", methods=["POST"])
+def email_event_invites(poll_id, date_id):
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({"error": "Please sign in.", "needs_login": True}), 401
+
+    conn = get_db()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute("SELECT * FROM polls WHERE id = %s", (poll_id,))
+    poll = cursor.fetchone()
+    if not poll:
+        conn.close()
+        return jsonify({"error": "Poll not found."}), 404
+    if not user_can_manage_poll(current_user, poll):
+        conn.close()
+        return jsonify({"error": "Only the poll organizer can send invites."}), 403
+    if not poll.get("closed_at"):
+        conn.close()
+        return jsonify({"error": "Close the poll before sending invites."}), 400
+
+    cursor.execute(
+        "SELECT * FROM dates WHERE id = %s AND poll_id = %s AND is_final = TRUE",
+        (date_id, poll_id)
+    )
+    date_row = cursor.fetchone()
+    if not date_row:
+        conn.close()
+        return jsonify({"error": "That date isn't a confirmed date for this poll."}), 400
+
+    attendees = _participant_emails(cursor, poll_id)
+    organizer_email = normalize_email(poll.get("admin_email"))
+    organizer_name = get_name(organizer_email) or organizer_email
+    conn.close()
+
+    if not attendees:
+        return jsonify({"error": "No participants have voted yet — no one to invite."}), 400
+
+    ics = generate_ics(poll, date_row, attendees, organizer_email, organizer_name)
+    attachment = {
+        "content": base64.b64encode(ics.encode("utf-8")).decode("ascii"),
+        "filename": f"templo-{poll['id']}-{date_row['date']}.ics",
+        "disposition": "attachment",
+    }
+
+    subject = f"Confirmed: {poll.get('name')} — {date_row['date']}"
+    html_body = (
+        f"<p><strong>{organizer_name}</strong> has confirmed a date for "
+        f"<strong>{poll.get('name')}</strong>.</p>"
+        f"<p><strong>Date:</strong> {date_row['date']} (all day)</p>"
+        "<p>The attached calendar invite (.ics) will add it to any calendar app — "
+        "Google Calendar, Outlook, Apple Calendar, etc.</p>"
+        "<p style=\"color:#6b7280;font-size:14px;margin-top:20px;\">Templo: templobooker.com</p>"
+    )
+
+    sent_count = 0
+    failures = []
+    for attendee in attendees:
+        ok, err = send_email(
+            attendee,
+            subject,
+            html_body,
+            reply_to=organizer_email,
+            attachments=[attachment],
+        )
+        if ok:
+            sent_count += 1
+        else:
+            failures.append({"email": attendee, "error": err})
+
+    if failures and sent_count == 0:
+        first = failures[0]
+        code, msg = classify_email_error(first.get("error"))
+        return jsonify({
+            "error": f"All invites failed ({code}). {msg}",
+            "failures": failures,
+        }), 502
+
+    return jsonify({
+        "success": True,
+        "sent": sent_count,
+        "failed": len(failures),
+        "failures": failures,
+    })
 
 
 @app.route("/poll/<poll_id>/vote", methods=["POST"])
@@ -1193,6 +1492,10 @@ def submit_vote(poll_id):
     if not can_vote_on_poll(current_user, poll):
         conn.close()
         return jsonify({"error": "This poll is invite-only and you're not on the list."}), 403
+
+    if poll.get("closed_at"):
+        conn.close()
+        return jsonify({"error": "This poll is closed and no longer accepting votes."}), 403
 
     cursor.execute("SELECT id FROM dates WHERE id = %s AND poll_id = %s", (date_id, poll_id))
     if not cursor.fetchone():

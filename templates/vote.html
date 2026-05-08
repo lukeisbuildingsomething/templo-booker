@@ -11,9 +11,9 @@
                     <h1 class="text-xl font-bold text-gray-900">{{ poll.name }}</h1>
                     <p class="text-sm text-gray-500">by {{ get_name(poll.admin_email) }}</p>
                 </div>
-                <div class="flex gap-2">
-                    {% if user_email %}
-                    <button 
+                <div class="flex flex-wrap gap-2 justify-end">
+                    {% if user_email and not is_closed %}
+                    <button
                         id="editBtn"
                         onclick="toggleEditMode()"
                         class="text-sm bg-indigo-100 text-indigo-700 py-2 px-4 rounded-lg hover:bg-indigo-200 transition-colors font-medium"
@@ -22,12 +22,27 @@
                     </button>
                     {% endif %}
                     {% if poll.can_manage %}
-                    <a 
+                    <a
                         href="/share/{{ poll.id }}"
                         class="text-sm bg-indigo-100 text-indigo-700 py-2 px-4 rounded-lg hover:bg-indigo-200 transition-colors font-medium"
                     >
                         Manage
                     </a>
+                    {% if not is_closed %}
+                    <button
+                        type="button"
+                        onclick="openCloseModal()"
+                        class="text-sm bg-emerald-100 text-emerald-700 py-2 px-4 rounded-lg hover:bg-emerald-200 transition-colors font-medium"
+                    >
+                        Close Poll
+                    </button>
+                    {% else %}
+                    <form action="/poll/{{ poll.id }}/reopen" method="POST" onsubmit="return confirm('Reopen voting? This clears the confirmed dates.');">
+                        <button type="submit" class="text-sm bg-amber-100 text-amber-700 py-2 px-4 rounded-lg hover:bg-amber-200 transition-colors font-medium">
+                            Reopen Poll
+                        </button>
+                    </form>
+                    {% endif %}
                     <form action="/poll/{{ poll.id }}/delete" method="POST" onsubmit="return confirm('Delete this poll?');">
                         <button type="submit" class="text-sm bg-red-100 text-red-600 py-2 px-4 rounded-lg hover:bg-red-200 transition-colors">
                             Delete
@@ -39,7 +54,13 @@
         </div>
         
         <div class="p-5">
-            {% if not user_email %}
+            {% if is_closed %}
+            <div class="mb-4 p-4 rounded-lg bg-emerald-50 border border-emerald-200">
+                <p class="text-sm font-semibold text-emerald-900">Poll closed — final date{{ 's' if final_dates|length > 1 else '' }} confirmed.</p>
+                <p class="text-xs text-emerald-800 mt-0.5">Voting is locked. {% if poll.can_manage %}Use <strong>Reopen Poll</strong> above to restart voting.{% else %}Reach out to {{ get_name(poll.admin_email) }} if anything needs to change.{% endif %}</p>
+            </div>
+            {% endif %}
+            {% if not user_email and not is_closed %}
             <div class="mb-4 p-4 rounded-lg bg-indigo-50 border border-indigo-100 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
                 <div>
                     <p class="text-sm font-medium text-indigo-900">Enter your email to vote — no password needed.</p>
@@ -117,12 +138,14 @@
                 {% set date_votes = votes_dict.get(date.id, {}) %}
                 {% set yes_count = date_votes.values()|select('equalto', 'yes')|list|length %}
                 {% set current_vote = date_votes.get(user_email, '') if user_email else '' %}
-                <div class="date-row border rounded-lg p-4 {% if date.id in best_dates %}border-green-300 bg-green-50{% else %}border-gray-200{% endif %}" data-date-id="{{ date.id }}" data-date="{{ date.date }}" data-votes="{{ yes_count }}" data-is-best="{{ 'true' if date.id in best_dates else 'false' }}">
+                <div class="date-row border rounded-lg p-4 {% if date.is_final %}border-emerald-400 bg-emerald-50 ring-1 ring-emerald-300{% elif date.id in best_dates %}border-green-300 bg-green-50{% else %}border-gray-200{% endif %}" data-date-id="{{ date.id }}" data-date="{{ date.date }}" data-votes="{{ yes_count }}" data-is-best="{{ 'true' if date.id in best_dates else 'false' }}">
                     <div class="flex items-center justify-between gap-4">
                         <div class="flex-1">
-                            <div class="flex items-center gap-2">
+                            <div class="flex items-center gap-2 flex-wrap">
                                 <span class="font-medium text-gray-900">{{ date.date }}</span>
-                                {% if date.id in best_dates %}
+                                {% if date.is_final %}
+                                <span class="text-xs bg-emerald-600 text-white px-2 py-0.5 rounded-full">Confirmed</span>
+                                {% elif date.id in best_dates %}
                                 <span class="text-xs bg-green-500 text-white px-2 py-0.5 rounded-full">Best</span>
                                 {% endif %}
                             </div>
@@ -183,7 +206,62 @@
                 </div>
                 {% endfor %}
             </div>
-            
+
+            {% if is_closed and final_dates %}
+            <div class="mt-6 pt-4 border-t border-gray-100">
+                <h3 class="text-sm font-semibold text-gray-900 mb-3">Add to calendar</h3>
+                <p class="text-xs text-gray-500 mb-3">Confirmed date{{ 's' if final_dates|length > 1 else '' }} below. Each row has its own .ics file, an option to email invites to everyone who voted, and an AI Assistant prompt for organizers who'd rather use a chatbot with calendar access.</p>
+                <div class="space-y-3">
+                    {% for d in final_dates %}
+                    <div class="border border-emerald-200 rounded-lg p-3 bg-white">
+                        <div class="flex items-center justify-between gap-3 flex-wrap">
+                            <div>
+                                <div class="font-medium text-gray-900">{{ d.date }}</div>
+                                <div class="text-xs text-gray-500">All-day event</div>
+                            </div>
+                            <div class="flex flex-wrap gap-2">
+                                <a
+                                    href="/poll/{{ poll.id }}/event/{{ d.id }}.ics"
+                                    class="text-xs bg-gray-100 text-gray-700 py-2 px-3 rounded-lg hover:bg-gray-200 transition-colors"
+                                >
+                                    Download .ics
+                                </a>
+                                {% if poll.can_manage %}
+                                <button
+                                    type="button"
+                                    onclick="emailInvites({{ d.id }}, this)"
+                                    class="text-xs bg-emerald-600 text-white py-2 px-3 rounded-lg hover:bg-emerald-700 transition-colors"
+                                >
+                                    Email invites to voters
+                                </button>
+                                {% endif %}
+                            </div>
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+
+                {% if poll.can_manage and ai_prompt %}
+                <div class="mt-4 border border-indigo-200 rounded-lg p-3 bg-indigo-50/50">
+                    <div class="flex items-center justify-between gap-3 flex-wrap mb-2">
+                        <div>
+                            <div class="text-sm font-medium text-gray-900">AI Assistant prompt</div>
+                            <div class="text-xs text-gray-600">Copy and paste into a chatbot with calendar access (e.g. ChatGPT, Claude with Google Calendar) — it'll create the events and invite everyone for you.</div>
+                        </div>
+                        <button
+                            type="button"
+                            onclick="copyAiPrompt(this)"
+                            class="text-xs bg-indigo-600 text-white py-2 px-3 rounded-lg hover:bg-indigo-700 transition-colors whitespace-nowrap"
+                        >
+                            Copy prompt
+                        </button>
+                    </div>
+                    <pre id="ai-prompt-text" class="text-xs bg-white border border-gray-200 rounded-lg p-3 whitespace-pre-wrap text-gray-700 max-h-48 overflow-auto">{{ ai_prompt }}</pre>
+                </div>
+                {% endif %}
+            </div>
+            {% endif %}
+
             {% if participants|length > 0 %}
             <div class="mt-6 pt-4 border-t border-gray-100">
                 <h3 class="text-xs font-medium text-gray-500 uppercase tracking-wide mb-2">Participants</h3>
@@ -351,5 +429,106 @@
             return '<div class="w-8 h-8 rounded-full bg-amber-400 flex items-center justify-center text-white text-sm font-medium">?</div>';
         }
     }
+
+    function openCloseModal() {
+        const modal = document.getElementById('close-poll-modal');
+        if (modal) modal.classList.remove('hidden');
+    }
+    function closeCloseModal() {
+        const modal = document.getElementById('close-poll-modal');
+        if (modal) modal.classList.add('hidden');
+    }
+
+    async function submitClosePoll() {
+        const checked = Array.from(document.querySelectorAll('#close-poll-modal input[name="final_date"]:checked'))
+            .map(el => parseInt(el.value, 10));
+        const errEl = document.getElementById('close-poll-error');
+        if (!checked.length) {
+            errEl.textContent = 'Pick at least one final date.';
+            errEl.classList.remove('hidden');
+            return;
+        }
+        errEl.classList.add('hidden');
+
+        const btn = document.getElementById('confirm-close-btn');
+        btn.disabled = true;
+        btn.textContent = 'Closing…';
+        try {
+            const res = await fetch('/poll/{{ poll.id }}/close', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ date_ids: checked })
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || data.error) {
+                errEl.textContent = data.error || 'Failed to close poll.';
+                errEl.classList.remove('hidden');
+                return;
+            }
+            window.location.reload();
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'Close poll & confirm dates';
+        }
+    }
+
+    async function emailInvites(dateId, btn) {
+        const original = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = 'Sending…';
+        try {
+            const res = await fetch(`/poll/{{ poll.id }}/event/${dateId}/email-invites`, { method: 'POST' });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || data.error) {
+                alert(data.error || 'Failed to send invites.');
+                return;
+            }
+            const failed = data.failed || 0;
+            if (failed > 0) {
+                alert(`Sent ${data.sent} invite(s); ${failed} failed. Check the deploy logs for details.`);
+            } else {
+                btn.textContent = `Sent to ${data.sent}`;
+                setTimeout(() => { btn.textContent = original; btn.disabled = false; }, 3000);
+                return;
+            }
+        } catch (e) {
+            alert('Network error sending invites.');
+        }
+        btn.disabled = false;
+        btn.textContent = original;
+    }
+
+    function copyAiPrompt(btn) {
+        const text = document.getElementById('ai-prompt-text').textContent;
+        navigator.clipboard.writeText(text).then(() => {
+            const original = btn.textContent;
+            btn.textContent = 'Copied!';
+            setTimeout(() => { btn.textContent = original; }, 2000);
+        }).catch(() => alert('Could not copy. Select the text and copy manually.'));
+    }
 </script>
+
+{% if poll.can_manage and not is_closed %}
+<div id="close-poll-modal" class="hidden fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50">
+    <div class="bg-white rounded-xl shadow-xl max-w-md w-full p-6">
+        <h2 class="text-lg font-bold text-gray-900 mb-1">Close poll</h2>
+        <p class="text-sm text-gray-600 mb-4">Pick the final date(s). Voting will be locked. You can reopen the poll later.</p>
+        <div class="space-y-2 max-h-64 overflow-auto border border-gray-200 rounded-lg p-3">
+            {% for date in dates %}
+            {% set yes_count = votes_dict.get(date.id, {}).values()|select('equalto', 'yes')|list|length %}
+            <label class="flex items-center gap-3 cursor-pointer hover:bg-gray-50 p-2 rounded">
+                <input type="checkbox" name="final_date" value="{{ date.id }}" class="rounded text-indigo-600">
+                <span class="flex-1 text-sm text-gray-800">{{ date.date }}</span>
+                <span class="text-xs text-gray-500">{{ yes_count }} yes</span>
+            </label>
+            {% endfor %}
+        </div>
+        <p id="close-poll-error" class="hidden mt-3 text-sm text-red-600"></p>
+        <div class="flex gap-3 mt-5">
+            <button type="button" onclick="closeCloseModal()" class="flex-1 py-2 px-4 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50">Cancel</button>
+            <button id="confirm-close-btn" type="button" onclick="submitClosePoll()" class="flex-1 py-2 px-4 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700">Close poll & confirm dates</button>
+        </div>
+    </div>
+</div>
+{% endif %}
 {% endblock %}
