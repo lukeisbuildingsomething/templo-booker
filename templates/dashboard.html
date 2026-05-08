@@ -32,9 +32,9 @@
     </div>
     {% endif %}
     
-    {% if polls %}
-    <div class="space-y-4">
-        {% for poll in polls %}
+    {% set open_polls = polls | rejectattr('closed_at') | list %}
+    {% set closed_polls = polls | selectattr('closed_at') | list %}
+    {% macro poll_card(poll) -%}
         <div class="bg-white rounded-xl shadow p-6 hover:shadow-lg transition-shadow">
             <div class="flex justify-between items-start">
                 <div>
@@ -43,6 +43,11 @@
                         Created by {{ get_name(poll.admin_email) }}{% if poll.is_owner %} <span class="text-indigo-600">(you)</span>{% endif %}
                     </p>
                     <div class="flex flex-wrap items-center gap-2 mt-2">
+                        {% if poll.closed_at %}
+                        <span class="text-xs px-2 py-1 rounded-full bg-emerald-100 text-emerald-800">Closed</span>
+                        {% else %}
+                        <span class="text-xs px-2 py-1 rounded-full bg-sky-100 text-sky-800">Open</span>
+                        {% endif %}
                         {% if poll.is_owner %}
                         <span class="text-xs px-2 py-1 rounded-full bg-indigo-100 text-indigo-700">Owner</span>
                         {% elif poll.is_invited %}
@@ -56,21 +61,21 @@
                     <p class="text-xs text-gray-400 mt-1">{{ poll.created_at }}</p>
                 </div>
                 <div class="flex flex-wrap gap-2 justify-end">
-                    <a 
+                    <a
                         href="/poll/{{ poll.id }}"
                         class="bg-gray-100 text-gray-700 py-2 px-4 rounded-lg font-medium hover:bg-gray-200 transition-colors text-sm"
                     >
                         View
                     </a>
                     {% if poll.can_manage %}
-                    <a 
+                    <a
                         href="/share/{{ poll.id }}"
                         class="bg-indigo-100 text-indigo-700 py-2 px-4 rounded-lg font-medium hover:bg-indigo-200 transition-colors text-sm"
                     >
                         Manage
                     </a>
                     <form action="/poll/{{ poll.id }}/delete" method="POST" onsubmit="return confirm('Delete this poll?');">
-                        <button 
+                        <button
                             type="submit"
                             class="bg-red-100 text-red-700 py-2 px-4 rounded-lg font-medium hover:bg-red-200 transition-colors text-sm"
                         >
@@ -81,8 +86,27 @@
                 </div>
             </div>
         </div>
-        {% endfor %}
+    {%- endmacro %}
+
+    {% if polls %}
+    {% if open_polls %}
+    <div class="space-y-4">
+        {% for poll in open_polls %}{{ poll_card(poll) }}{% endfor %}
     </div>
+    {% endif %}
+
+    {% if closed_polls %}
+    <details class="mt-8 group" {% if not open_polls %}open{% endif %}>
+        <summary class="cursor-pointer flex items-center gap-2 text-sm font-semibold text-gray-700 hover:text-gray-900 select-none list-none">
+            <svg class="w-4 h-4 transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"></path></svg>
+            Closed Polls
+            <span class="text-xs font-normal text-gray-500">({{ closed_polls|length }})</span>
+        </summary>
+        <div class="space-y-4 mt-4">
+            {% for poll in closed_polls %}{{ poll_card(poll) }}{% endfor %}
+        </div>
+    </details>
+    {% endif %}
     {% else %}
     <div class="bg-white rounded-xl shadow-lg p-12 text-center">
         <div class="w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-4">
