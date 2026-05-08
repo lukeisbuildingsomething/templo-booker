@@ -1073,6 +1073,7 @@ def view_poll(poll_id):
     votes_dict = {}
     participants = set()
     yes_counts = {}
+    possible_dates = []
 
     for date in dates:
         cursor.execute(
@@ -1085,6 +1086,10 @@ def view_poll(poll_id):
         yes_counts[date["id"]] = sum(1 for v in date_votes if v["status"] == "yes")
         for v in date_votes:
             participants.add(v["user_email"])
+
+        statuses = {v["status"] for v in date_votes}
+        if statuses and "no" not in statuses:
+            possible_dates.append(date["id"])
 
     conn.close()
 
@@ -1110,6 +1115,7 @@ def view_poll(poll_id):
         participants=sorted_participants,
         user_email=current_user["email"] if current_user else None,
         best_dates=best_dates,
+        possible_dates=possible_dates,
         is_closed=is_closed,
         final_dates=final_dates,
         ai_prompt=ai_prompt,
