@@ -29,3 +29,6 @@ env/
 *.log
 .DS_Store
 static/uploads/
+.local/
+attached_assets/
+.venv-test/

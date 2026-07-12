@@ -8,9 +8,11 @@ from pathlib import Path
 import psycopg2
 import requests
 from dotenv import load_dotenv
+from markupsafe import escape
 from psycopg2.extras import RealDictCursor
-from datetime import date as _date, datetime, timedelta
-from flask import Flask, render_template, request, redirect, url_for, session, jsonify, flash
+from datetime import date as _date, datetime, timedelta, timezone
+from flask import Flask, g, has_app_context, render_template, request, redirect, url_for, session, jsonify, flash
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
 
 load_dotenv()
@@ -20,6 +22,16 @@ app.secret_key = os.environ.get("SESSION_SECRET")
 if not app.secret_key:
     raise RuntimeError("SESSION_SECRET environment variable is required")
 app.permanent_session_lifetime = timedelta(days=30)
+
+# Railway terminates TLS at its proxy; trust X-Forwarded-* so request.url_root
+# and generated links (magic-link emails) use https and the public host.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "1").lower() in ("1", "true", "yes"),
+)
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
@@ -254,7 +266,7 @@ def generate_ics(poll, date_row, attendees, organizer_email, organizer_name, sen
     day = _date(parts[0], parts[1], parts[2])
     start_hhmm = _parse_hhmm(poll.get("event_start_time"))
     end_hhmm = _parse_hhmm(poll.get("event_end_time"))
-    dtstamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    dtstamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     uid = f"{poll['id']}-{date_row['id']}@templobooker.com"
 
     if start_hhmm and end_hhmm:
@@ -443,10 +455,14 @@ def default_tier_for_email(email):
 
 
 def is_valid_date_string(value):
+    # Strict zero-padded YYYY-MM-DD so lexicographic date comparisons are safe
+    # (strptime alone accepts e.g. "2026-1-1").
+    if not isinstance(value, str) or not re.match(r"^\d{4}-\d{2}-\d{2}$", value):
+        return False
     try:
         datetime.strptime(value, "%Y-%m-%d")
         return True
-    except (TypeError, ValueError):
+    except ValueError:
         return False
 
 
@@ -516,16 +532,35 @@ def generate_token():
     return secrets.token_urlsafe(32)
 
 
+MAGIC_LINKS_PER_HOUR = 5
+
+
+def magic_link_rate_limited(cursor, email):
+    """True if this email has already been sent too many sign-in links recently.
+
+    Guards the public login/poll-access forms against being used to spam
+    someone's inbox. Also opportunistically prunes long-expired tokens.
+    """
+    cursor.execute("DELETE FROM magic_links WHERE expires_at < NOW() - INTERVAL '7 days'")
+    cursor.execute(
+        "SELECT COUNT(*) FROM magic_links WHERE LOWER(email) = %s AND created_at > NOW() - INTERVAL '1 hour'",
+        (normalize_email(email),)
+    )
+    row = cursor.fetchone()
+    count = row[0] if not isinstance(row, dict) else row["count"]
+    return count >= MAGIC_LINKS_PER_HOUR
+
+
 def send_admin_request_notification(requester_email, requester_name, reason, approval_token, request_url_root):
     approve_url = request_url_root.rstrip("/") + url_for("approve_request_via_email", token=approval_token)
     admin_url = request_url_root.rstrip("/") + url_for("admin_panel")
     display_name = requester_name or requester_email.split("@")[0]
-    reason_html = f"<p><strong>Reason:</strong> {reason}</p>" if reason else ""
+    reason_html = f"<p><strong>Reason:</strong> {escape(reason)}</p>" if reason else ""
 
     html_body = f"""
         <h2>New Account Request</h2>
-        <p><strong>Email:</strong> {requester_email}</p>
-        <p><strong>Name:</strong> {display_name}</p>
+        <p><strong>Email:</strong> {escape(requester_email)}</p>
+        <p><strong>Name:</strong> {escape(display_name)}</p>
         {reason_html}
         <p style="margin-top: 20px;">
             <a href="{approve_url}" style="background-color: #16a34a; color: white; padding: 12px 24px; text-decoration: none; border-radius: 8px; display: inline-block; font-weight: bold;">Approve Request</a>
@@ -549,9 +584,9 @@ def send_magic_link_email(to_email, token, poll, request_url_root):
         poll_name = poll.get("name") or "your poll"
         inviter_name = get_name(poll.get("admin_email"))
         inviter_line = (
-            f"<p>{inviter_name} invited you to vote on dates for <strong>{poll_name}</strong>.</p>"
+            f"<p>{escape(inviter_name)} invited you to vote on dates for <strong>{escape(poll_name)}</strong>.</p>"
             if inviter_name
-            else f"<p>You've been invited to vote on dates for <strong>{poll_name}</strong>.</p>"
+            else f"<p>You've been invited to vote on dates for <strong>{escape(poll_name)}</strong>.</p>"
         )
         cta = "Open Poll"
         subject = f"Your sign-in link for {poll_name}"
@@ -644,9 +679,13 @@ def can_vote_on_poll(user, poll):
 
 
 def get_owned_poll_count(email):
+    """Count *active* (not closed) polls — the free-tier limit is per active poll."""
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM polls WHERE LOWER(admin_email) = %s", (normalize_email(email),))
+    cursor.execute(
+        "SELECT COUNT(*) FROM polls WHERE LOWER(admin_email) = %s AND closed_at IS NULL",
+        (normalize_email(email),)
+    )
     count = cursor.fetchone()[0]
     conn.close()
     return count
@@ -680,7 +719,24 @@ def sync_admin_account(conn, email):
 
 def get_db():
     conn = psycopg2.connect(DATABASE_URL)
+    # Track connections per-request so any left open when a route raises
+    # (routes don't use try/finally) are closed instead of leaking.
+    if has_app_context():
+        conns = getattr(g, "_db_conns", None)
+        if conns is None:
+            conns = []
+            g._db_conns = conns
+        conns.append(conn)
     return conn
+
+
+@app.teardown_appcontext
+def _close_db_connections(exc):
+    for conn in getattr(g, "_db_conns", []):
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def init_db():
@@ -861,6 +917,13 @@ def login():
 
         conn = get_db()
         cursor = conn.cursor()
+
+        if magic_link_rate_limited(cursor, email):
+            conn.commit()
+            conn.close()
+            flash("Too many sign-in links requested for this email. Check your inbox (and spam), or try again in an hour.", "error")
+            return redirect(url_for("login"))
+
         cursor.execute(
             "INSERT INTO users (email, role, tier) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
             (email, default_role_for_email(email), default_tier_for_email(email))
@@ -933,7 +996,7 @@ def create_poll_step1():
     if current_user["tier"] == "free":
         owned_poll_count = get_owned_poll_count(current_user["email"])
         if owned_poll_count >= FREE_POLL_LIMIT:
-            flash("Free tier allows 1 active poll at a time. Delete your existing poll or upgrade to Pro.", "error")
+            flash("Free tier allows 1 active poll at a time. Close or delete your existing poll, or upgrade to Pro.", "error")
             return redirect(url_for("dashboard"))
 
     session["poll_name"] = poll_name
@@ -988,7 +1051,7 @@ def finalize_poll():
     if any(not is_valid_date_string(date_str) for date_str in selected_dates):
         return jsonify({"error": "One or more selected dates are invalid."}), 400
 
-    today_iso = datetime.utcnow().strftime("%Y-%m-%d")
+    today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if any(date_str < today_iso for date_str in selected_dates):
         return jsonify({"error": "Past dates are not allowed."}), 400
 
@@ -997,7 +1060,7 @@ def finalize_poll():
             return jsonify({"error": f"Free tier allows up to {FREE_DATE_LIMIT} dates per poll."}), 400
         owned_poll_count = get_owned_poll_count(current_user["email"])
         if owned_poll_count >= FREE_POLL_LIMIT:
-            return jsonify({"error": "Free tier allows 1 active poll at a time. Delete your existing poll or upgrade."}), 400
+            return jsonify({"error": "Free tier allows 1 active poll at a time. Close or delete your existing poll, or upgrade."}), 400
     
     conn = get_db()
     cursor = conn.cursor()
@@ -1212,28 +1275,30 @@ def view_poll(poll_id):
     cursor.execute("SELECT * FROM dates WHERE poll_id = %s ORDER BY date", (poll_id,))
     dates = cursor.fetchall()
 
-    votes_dict = {}
+    cursor.execute(
+        '''SELECT v.date_id, v.user_email, v.status
+           FROM votes v JOIN dates d ON d.id = v.date_id
+           WHERE d.poll_id = %s''',
+        (poll_id,)
+    )
+    all_votes = cursor.fetchall()
+    conn.close()
+
+    votes_dict = {date["id"]: {} for date in dates}
     participants = set()
-    yes_counts = {}
+    yes_counts = {date["id"]: 0 for date in dates}
     possible_dates = []
 
+    for v in all_votes:
+        votes_dict.setdefault(v["date_id"], {})[v["user_email"]] = v["status"]
+        if v["status"] == "yes":
+            yes_counts[v["date_id"]] = yes_counts.get(v["date_id"], 0) + 1
+        participants.add(v["user_email"])
+
     for date in dates:
-        cursor.execute(
-            "SELECT user_email, status FROM votes WHERE date_id = %s",
-            (date["id"],)
-        )
-        date_votes = cursor.fetchall()
-
-        votes_dict[date["id"]] = {v["user_email"]: v["status"] for v in date_votes}
-        yes_counts[date["id"]] = sum(1 for v in date_votes if v["status"] == "yes")
-        for v in date_votes:
-            participants.add(v["user_email"])
-
-        statuses = {v["status"] for v in date_votes}
+        statuses = set(votes_dict.get(date["id"], {}).values())
         if statuses and "no" not in statuses:
             possible_dates.append(date["id"])
-
-    conn.close()
 
     max_yes = max(yes_counts.values()) if yes_counts else 0
     best_dates = [d_id for d_id, count in yes_counts.items() if count == max_yes and max_yes > 0]
@@ -1298,6 +1363,13 @@ def poll_access(poll_id):
         token = generate_token()
         conn = get_db()
         cursor = conn.cursor()
+
+        if magic_link_rate_limited(cursor, email):
+            conn.commit()
+            conn.close()
+            flash("Too many sign-in links requested for this email. Check your inbox (and spam), or try again in an hour.", "error")
+            return redirect(url_for("poll_access", poll_id=poll_id))
+
         cursor.execute(
             "INSERT INTO magic_links (email, token, poll_id, expires_at) VALUES (%s, %s, %s, NOW() + INTERVAL '24 hours')",
             (email, token, poll_id)
@@ -1637,7 +1709,7 @@ def submit_vote(poll_id):
         '''INSERT INTO votes (date_id, user_email, status)
            VALUES (%s, %s, %s)
            ON CONFLICT(date_id, user_email)
-           DO UPDATE SET status = EXCLUDED.status''',
+           DO UPDATE SET status = EXCLUDED.status, created_at = NOW()''',
         (date_id, current_user["email"], status)
     )
 
@@ -2166,10 +2238,15 @@ def profile():
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     
     if request.method == "POST":
-        display_name = request.form.get("display_name", "").strip()
+        display_name = request.form.get("display_name", "").strip()[:100]
         new_email = normalize_email(request.form.get("email", user_email))
         profile_picture = request.form.get("profile_picture", "").strip()
         current_email = normalize_email(user_email)
+
+        if profile_picture and not re.match(r"^https?://", profile_picture, re.IGNORECASE):
+            conn.close()
+            flash("Profile picture must be an http(s) URL.", "error")
+            return redirect(url_for("profile"))
 
         if not new_email:
             conn.close()
@@ -2341,22 +2418,22 @@ def marketing_why_us():
 @app.route("/contact", methods=["GET", "POST"])
 def marketing_contact():
     if request.method == "POST":
-        name = request.form.get("name", "").strip()
+        name = re.sub(r"[\r\n]+", " ", request.form.get("name", "")).strip()[:100]
         email = normalize_email(request.form.get("email", ""))
-        subject = request.form.get("subject", "general").strip()
-        message = request.form.get("message", "").strip()
+        subject = re.sub(r"[\r\n]+", " ", request.form.get("subject", "general")).strip()[:150]
+        message = request.form.get("message", "").strip()[:5000]
 
-        if not name or not email or not message:
+        if not name or not email or "@" not in email or not message:
             flash("Please fill in all required fields.", "error")
             return redirect(url_for("marketing_contact"))
 
         html_body = f"""
             <h2>New Contact Form Submission</h2>
-            <p><strong>Name:</strong> {name}</p>
-            <p><strong>Email:</strong> {email}</p>
-            <p><strong>Subject:</strong> {subject}</p>
+            <p><strong>Name:</strong> {escape(name)}</p>
+            <p><strong>Email:</strong> {escape(email)}</p>
+            <p><strong>Subject:</strong> {escape(subject)}</p>
             <hr>
-            <p>{message.replace(chr(10), '<br>')}</p>
+            <p>{str(escape(message)).replace(chr(10), '<br>')}</p>
             <hr>
             <p style="color: #6b7280; font-size: 14px;">Sent from the Templo contact form at templobooker.com</p>
         """
@@ -2374,6 +2451,26 @@ def marketing_contact():
         return redirect(url_for("marketing_contact"))
 
     return render_template("marketing_contact.html")
+
+
+@app.errorhandler(404)
+def handle_not_found(e):
+    return render_template(
+        "error.html",
+        code=404,
+        title="Page not found",
+        message="That page doesn't exist — the link may be old or mistyped.",
+    ), 404
+
+
+@app.errorhandler(500)
+def handle_server_error(e):
+    return render_template(
+        "error.html",
+        code=500,
+        title="Something went wrong",
+        message="We hit an unexpected error. Please try again in a moment.",
+    ), 500
 
 
 if __name__ == "__main__":

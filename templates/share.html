@@ -167,11 +167,14 @@
 </div>
 
 <script>
-    function copyUrl() {
+    async function copyUrl() {
         const urlInput = document.getElementById('poll-url');
-        urlInput.select();
-        document.execCommand('copy');
-
+        try {
+            await navigator.clipboard.writeText(urlInput.value);
+        } catch (e) {
+            urlInput.select();
+            document.execCommand('copy');
+        }
         const successMsg = document.getElementById('copy-success');
         successMsg.classList.remove('hidden');
         setTimeout(() => successMsg.classList.add('hidden'), 3000);

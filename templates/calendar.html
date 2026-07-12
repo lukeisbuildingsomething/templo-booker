@@ -143,9 +143,14 @@
         const prevMonthLastDay = new Date(year, month, 0).getDate();
         for (let i = startDay - 1; i >= 0; i--) {
             const day = prevMonthLastDay - i;
-            const dateStr = formatDate(new Date(year, month - 1, day));
+            const date = new Date(year, month - 1, day);
+            const dateStr = formatDate(date);
             const isSelected = selectedDates.has(dateStr);
-            html += `<div class="calendar-day other-month ${isSelected ? 'selected' : ''}" data-date="${dateStr}" onclick="toggleDate('${dateStr}', this)">${day}</div>`;
+            if (date < today) {
+                html += `<div class="calendar-day other-month disabled">${day}</div>`;
+            } else {
+                html += `<div class="calendar-day other-month ${isSelected ? 'selected' : ''}" data-date="${dateStr}" onclick="toggleDate('${dateStr}', this)">${day}</div>`;
+            }
         }
         
         for (let day = 1; day <= totalDays; day++) {
@@ -169,16 +174,24 @@
         
         const remainingCells = 42 - (startDay + totalDays);
         for (let day = 1; day <= remainingCells; day++) {
-            const dateStr = formatDate(new Date(year, month + 1, day));
+            const date = new Date(year, month + 1, day);
+            const dateStr = formatDate(date);
             const isSelected = selectedDates.has(dateStr);
-            html += `<div class="calendar-day other-month ${isSelected ? 'selected' : ''}" data-date="${dateStr}" onclick="toggleDate('${dateStr}', this)">${day}</div>`;
+            if (date < today) {
+                html += `<div class="calendar-day other-month disabled">${day}</div>`;
+            } else {
+                html += `<div class="calendar-day other-month ${isSelected ? 'selected' : ''}" data-date="${dateStr}" onclick="toggleDate('${dateStr}', this)">${day}</div>`;
+            }
         }
         
         document.getElementById('calendar').innerHTML = html;
     }
     
     function formatDate(date) {
-        return date.toISOString().split('T')[0];
+        const y = date.getFullYear();
+        const m = String(date.getMonth() + 1).padStart(2, '0');
+        const d = String(date.getDate()).padStart(2, '0');
+        return `${y}-${m}-${d}`;
     }
     
     function toggleDate(dateStr, el) {
