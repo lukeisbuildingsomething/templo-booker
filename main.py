@@ -14,6 +14,7 @@ from datetime import date as _date, datetime, timedelta, timezone
 from flask import Flask, g, has_app_context, render_template, request, redirect, url_for, session, jsonify, flash
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 load_dotenv()
 
@@ -22,6 +23,9 @@ app.secret_key = os.environ.get("SESSION_SECRET")
 if not app.secret_key:
     raise RuntimeError("SESSION_SECRET environment variable is required")
 app.permanent_session_lifetime = timedelta(days=30)
+
+# Signs the contact-form timing token used for spam protection.
+contact_form_serializer = URLSafeTimedSerializer(app.secret_key, salt="contact-form")
 
 # Railway terminates TLS at its proxy; trust X-Forwarded-* so request.url_root
 # and generated links (magic-link emails) use https and the public host.
@@ -2418,6 +2422,29 @@ def marketing_why_us():
 @app.route("/contact", methods=["GET", "POST"])
 def marketing_contact():
     if request.method == "POST":
+        # --- Spam protection (fails silently so bots don't learn to adapt) ---
+        # 1. Honeypot: a hidden field real users never see. Bots auto-fill it.
+        if request.form.get("website", "").strip():
+            flash("Message sent! We'll get back to you soon.", "success")
+            return redirect(url_for("marketing_contact"))
+
+        # 2. Timing trap: a signed token issued when the page loaded. Reject
+        #    submissions completed implausibly fast (bots submit instantly) or
+        #    with a missing/forged/stale token.
+        MIN_FILL_SECONDS = 3
+        MAX_FORM_AGE_SECONDS = 60 * 60 * 6  # 6h — token effectively expires
+        token = request.form.get("form_token", "")
+        try:
+            _, issued_at = contact_form_serializer.loads(
+                token, max_age=MAX_FORM_AGE_SECONDS, return_timestamp=True
+            )
+            elapsed = (datetime.now(timezone.utc) - issued_at).total_seconds()
+        except (BadSignature, SignatureExpired, ValueError):
+            elapsed = -1
+        if elapsed < MIN_FILL_SECONDS:
+            flash("Message sent! We'll get back to you soon.", "success")
+            return redirect(url_for("marketing_contact"))
+
         name = re.sub(r"[\r\n]+", " ", request.form.get("name", "")).strip()[:100]
         email = normalize_email(request.form.get("email", ""))
         subject = re.sub(r"[\r\n]+", " ", request.form.get("subject", "general")).strip()[:150]
@@ -2450,7 +2477,10 @@ def marketing_contact():
         flash("Message sent! We'll get back to you soon.", "success")
         return redirect(url_for("marketing_contact"))
 
-    return render_template("marketing_contact.html")
+    return render_template(
+        "marketing_contact.html",
+        form_token=contact_form_serializer.dumps("contact"),
+    )
 
 
 @app.errorhandler(404)
