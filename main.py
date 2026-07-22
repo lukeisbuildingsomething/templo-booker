@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from markupsafe import escape
 from psycopg2.extras import RealDictCursor
 from datetime import date as _date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from flask import Flask, g, has_app_context, render_template, request, redirect, url_for, session, jsonify, flash
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
@@ -218,6 +219,22 @@ def _parse_hhmm(value):
     return int(m.group(1)), int(m.group(2))
 
 
+def _get_zoneinfo(tz_name):
+    """Return a ZoneInfo for a valid IANA name, or None (unknown/blank)."""
+    if not tz_name:
+        return None
+    try:
+        return ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+
+
+def _utc_offset_colon(dt):
+    """UTC offset of an aware datetime as '+HH:MM' / '-HH:MM' (for ISO deeplinks)."""
+    off = dt.strftime("%z")  # e.g. '-0400'
+    return off[:3] + ":" + off[3:] if off else "+00:00"
+
+
 def build_calendar_deeplinks(poll, date_row, attendees):
     """Return {google_url, outlook_url} for a confirmed date, prefilled with attendees.
 
@@ -235,6 +252,8 @@ def build_calendar_deeplinks(poll, date_row, attendees):
     day = _date(parts[0], parts[1], parts[2])
     start_hhmm = _parse_hhmm(poll.get("event_start_time"))
     end_hhmm = _parse_hhmm(poll.get("event_end_time"))
+    tz_name = poll.get("event_timezone")
+    tz = _get_zoneinfo(tz_name)
 
     if start_hhmm and end_hhmm:
         sh, sm = start_hhmm
@@ -243,6 +262,13 @@ def build_calendar_deeplinks(poll, date_row, attendees):
             end_day = day + timedelta(days=1)
         else:
             end_day = day
+        # Google reads the local time strings and interprets them in the ctz
+        # timezone (added to google_params below). Outlook reads an ISO offset,
+        # so we suffix the UTC offset for this specific date (DST-correct).
+        start_off = end_off = ""
+        if tz is not None:
+            start_off = _utc_offset_colon(datetime(day.year, day.month, day.day, sh, sm, tzinfo=tz))
+            end_off = _utc_offset_colon(datetime(end_day.year, end_day.month, end_day.day, eh, em, tzinfo=tz))
         google_dates = (
             f"{day.strftime('%Y%m%d')}T{sh:02d}{sm:02d}00/"
             f"{end_day.strftime('%Y%m%d')}T{eh:02d}{em:02d}00"
@@ -252,8 +278,8 @@ def build_calendar_deeplinks(poll, date_row, attendees):
             "rru": "addevent",
             "subject": title,
             "body": description,
-            "startdt": f"{day.strftime('%Y-%m-%d')}T{sh:02d}:{sm:02d}:00",
-            "enddt": f"{end_day.strftime('%Y-%m-%d')}T{eh:02d}:{em:02d}:00",
+            "startdt": f"{day.strftime('%Y-%m-%d')}T{sh:02d}:{sm:02d}:00{start_off}",
+            "enddt": f"{end_day.strftime('%Y-%m-%d')}T{eh:02d}:{em:02d}:00{end_off}",
             "to": attendee_csv,
         }
     else:
@@ -277,6 +303,10 @@ def build_calendar_deeplinks(poll, date_row, attendees):
         "details": description,
         "add": attendee_csv,
     }
+    # Tell Google which timezone the local time strings are in (timed events
+    # only; all-day events are timezone-independent).
+    if tz is not None and start_hhmm and end_hhmm:
+        google_params["ctz"] = tz_name
 
     return {
         "google_url": "https://calendar.google.com/calendar/render?" + urlencode(google_params),
@@ -285,12 +315,15 @@ def build_calendar_deeplinks(poll, date_row, attendees):
 
 
 def event_time_label(poll, date_row):
-    """Human-readable time label, e.g. '2026-05-15 (all day)' or '2026-05-15, 14:00–15:30'."""
+    """Human-readable time label, e.g. '2026-05-15 (all day)' or
+    '2026-05-15, 14:00–15:30 (America/New_York)'."""
     date_str = date_row.get("date") or ""
     start = poll.get("event_start_time") if poll else None
     end = poll.get("event_end_time") if poll else None
+    tz_name = poll.get("event_timezone") if poll else None
     if start and end:
-        return f"{date_str}, {start}–{end}"
+        suffix = f" ({tz_name})" if tz_name else ""
+        return f"{date_str}, {start}–{end}{suffix}"
     return f"{date_str} (all day)"
 
 
@@ -298,8 +331,11 @@ def generate_ics(poll, date_row, attendees, organizer_email, organizer_name, sen
     """Build an RFC 5545 VCALENDAR string for a date row.
 
     Times are sourced from poll.event_start_time / poll.event_end_time
-    (HH:MM). When both are set, emits a timed floating-time event;
-    otherwise an all-day event.
+    (HH:MM). When both are set and poll.event_timezone is a known IANA zone,
+    the local wall-clock time is converted to UTC (DTSTART/DTEND end with 'Z')
+    so every attendee's calendar shows the correct absolute moment regardless
+    of their own timezone. Without a stored timezone it falls back to a
+    floating-time event; if no times are set it's an all-day event.
 
     When ``sent_by_email`` is given and differs from organizer_email
     (the email-invites path), the calendar ORGANIZER is set to the
@@ -318,14 +354,25 @@ def generate_ics(poll, date_row, attendees, organizer_email, organizer_name, sen
     if start_hhmm and end_hhmm:
         sh, sm = start_hhmm
         eh, em = end_hhmm
-        dtstart = f"{day.strftime('%Y%m%d')}T{sh:02d}{sm:02d}00"
         # If end time is earlier or equal, treat as next-day end
-        if (eh, em) <= (sh, sm):
-            end_day = day + timedelta(days=1)
-            dtend = f"{end_day.strftime('%Y%m%d')}T{eh:02d}{em:02d}00"
+        end_day = day + timedelta(days=1) if (eh, em) <= (sh, sm) else day
+        tz = _get_zoneinfo(poll.get("event_timezone"))
+        if tz is not None:
+            # Convert the organizer's local wall-clock time (on this specific
+            # date, so DST is handled correctly) to UTC. Attendees in any
+            # timezone then see the right absolute time.
+            start_utc = datetime(day.year, day.month, day.day, sh, sm, tzinfo=tz).astimezone(timezone.utc)
+            end_utc = datetime(end_day.year, end_day.month, end_day.day, eh, em, tzinfo=tz).astimezone(timezone.utc)
+            dt_lines = [
+                f"DTSTART:{start_utc.strftime('%Y%m%dT%H%M%SZ')}",
+                f"DTEND:{end_utc.strftime('%Y%m%dT%H%M%SZ')}",
+            ]
         else:
-            dtend = f"{day.strftime('%Y%m%d')}T{eh:02d}{em:02d}00"
-        dt_lines = [f"DTSTART:{dtstart}", f"DTEND:{dtend}"]
+            # No stored timezone → floating time (renders in the viewer's zone).
+            dt_lines = [
+                f"DTSTART:{day.strftime('%Y%m%d')}T{sh:02d}{sm:02d}00",
+                f"DTEND:{end_day.strftime('%Y%m%d')}T{eh:02d}{em:02d}00",
+            ]
     else:
         end_day = day + timedelta(days=1)
         dt_lines = [
@@ -400,7 +447,9 @@ def build_ai_calendar_prompt(poll, final_dates, attendees, organizer_email):
     for d in final_dates:
         lines.append(f"- {event_time_label(poll, d)} — *{poll.get('name')}*")
     lines.append("")
-    lines.append("Times are in the organizer's local timezone. Use my default calendar and send invitations so each attendee can RSVP.")
+    tz_name = poll.get("event_timezone")
+    tz_note = f"Times are in the {tz_name} timezone." if tz_name else "Times are in the organizer's local timezone."
+    lines.append(f"{tz_note} Use my default calendar and send invitations so each attendee can RSVP.")
     return "\n".join(lines)
 
 
@@ -853,6 +902,7 @@ def init_db():
         cursor.execute("ALTER TABLE polls ADD COLUMN IF NOT EXISTS closed_by TEXT")
         cursor.execute("ALTER TABLE polls ADD COLUMN IF NOT EXISTS event_start_time TEXT")
         cursor.execute("ALTER TABLE polls ADD COLUMN IF NOT EXISTS event_end_time TEXT")
+        cursor.execute("ALTER TABLE polls ADD COLUMN IF NOT EXISTS event_timezone TEXT")
         cursor.execute("UPDATE polls SET access_mode = 'public_link' WHERE access_mode IS NULL")
         cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS polls_slug_unique ON polls(slug) WHERE slug IS NOT NULL")
     except Exception as e:
@@ -1668,6 +1718,11 @@ def set_poll_event_time(poll_id):
     all_day = bool(data.get("all_day"))
     start_time = (data.get("start_time") or "").strip() or None
     end_time = (data.get("end_time") or "").strip() or None
+    # The organizer's IANA timezone (from the browser). Validated; ignored if
+    # unknown so a bad value can never break time storage.
+    tz_name = (data.get("timezone") or "").strip() or None
+    if tz_name and _get_zoneinfo(tz_name) is None:
+        tz_name = None
 
     if not all_day:
         if not start_time or not end_time:
@@ -1686,16 +1741,30 @@ def set_poll_event_time(poll_id):
         conn.close()
         return jsonify({"error": "Only the poll organizer can set event times."}), 403
 
+    # Only overwrite the stored timezone when the client sent a valid one, so a
+    # save from an old cached page can't wipe a previously-set zone.
     if all_day:
-        cursor.execute(
-            "UPDATE polls SET event_start_time = NULL, event_end_time = NULL WHERE id = %s",
-            (poll_id,)
-        )
+        if tz_name:
+            cursor.execute(
+                "UPDATE polls SET event_start_time = NULL, event_end_time = NULL, event_timezone = %s WHERE id = %s",
+                (tz_name, poll_id)
+            )
+        else:
+            cursor.execute(
+                "UPDATE polls SET event_start_time = NULL, event_end_time = NULL WHERE id = %s",
+                (poll_id,)
+            )
     else:
-        cursor.execute(
-            "UPDATE polls SET event_start_time = %s, event_end_time = %s WHERE id = %s",
-            (start_time, end_time, poll_id)
-        )
+        if tz_name:
+            cursor.execute(
+                "UPDATE polls SET event_start_time = %s, event_end_time = %s, event_timezone = %s WHERE id = %s",
+                (start_time, end_time, tz_name, poll_id)
+            )
+        else:
+            cursor.execute(
+                "UPDATE polls SET event_start_time = %s, event_end_time = %s WHERE id = %s",
+                (start_time, end_time, poll_id)
+            )
     conn.commit()
 
     # Re-fetch poll with new times so the AI prompt reflects them

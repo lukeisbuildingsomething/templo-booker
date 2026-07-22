@@ -80,7 +80,7 @@ r = c.post(f"/poll/{poll_id}/vote", json={"date_id": date_ids[0], "status": "may
 check("vote", r.status_code == 200)
 
 # Event time + close + ics + deeplinks
-r = c.post(f"/poll/{poll_id}/event-time", json={"all_day": False, "start_time": "18:00", "end_time": "20:00"})
+r = c.post(f"/poll/{poll_id}/event-time", json={"all_day": False, "start_time": "18:00", "end_time": "20:00", "timezone": "America/New_York"})
 check("set event time", r.status_code == 200)
 r = c.post(f"/poll/{poll_id}/close", json={"date_ids": [date_ids[0]]})
 check("close poll", r.status_code == 200)
@@ -88,6 +88,10 @@ r = c.get(f"/poll/{poll_id}")
 check("closed poll shows calendar view", r.status_code == 200 and b"calendar.google.com" in r.data)
 r = c.get(f"/poll/{poll_id}/event/{date_ids[0]}.ics")
 check("ics download", r.status_code == 200 and b"BEGIN:VCALENDAR" in r.data)
+# 18:00 on 2030-01-10 in America/New_York (EST, UTC-5) must be emitted as
+# 23:00 UTC — proves wall-clock times are converted to an absolute moment.
+check("ics converts local time to UTC", b"DTSTART:20300110T230000Z" in r.data and b"DTEND:20300111T010000Z" in r.data,
+      r.get_data(as_text=True))
 
 # Share page + settings update
 check("share page", c.get(f"/share/{poll_id}").status_code == 200)

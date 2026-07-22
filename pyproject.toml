@@ -14,4 +14,7 @@ dependencies = [
     # declared explicitly so a future Flask packaging change can't break us).
     "itsdangerous>=2.2.0",
     "markupsafe>=3.0.0",
+    # IANA timezone database for zoneinfo, so timezone conversion works even on
+    # platforms without a system tz database (Windows, slim containers).
+    "tzdata>=2025.1",
 ]

@@ -126,7 +126,7 @@
                             <div>
                                 <div class="font-medium text-gray-900">{{ d.date }}</div>
                                 <div class="text-xs text-gray-500 event-label">
-                                    {% if poll.event_start_time and poll.event_end_time %}{{ poll.event_start_time }}–{{ poll.event_end_time }} (organizer's local time){% else %}All-day event{% endif %}
+                                    {% if poll.event_start_time and poll.event_end_time %}{{ poll.event_start_time }}–{{ poll.event_end_time }}{% if poll.event_timezone %} ({{ poll.event_timezone }}){% else %} (organizer's local time){% endif %}{% else %}All-day event{% endif %}
                                 </div>
                             </div>
                             <div class="flex flex-wrap gap-2">
@@ -609,9 +609,10 @@
         status.textContent = 'Saving…';
         status.className = 'text-xs text-gray-400 ml-auto';
 
+        const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
         const body = allDay
-            ? { all_day: true }
-            : { all_day: false, start_time: start, end_time: end };
+            ? { all_day: true, timezone: tz }
+            : { all_day: false, start_time: start, end_time: end, timezone: tz };
 
         try {
             const res = await fetch(`/poll/{{ poll.id }}/event-time`, {
@@ -627,7 +628,7 @@
             }
             const labelText = allDay
                 ? 'All-day event'
-                : `${data.start_time}–${data.end_time} (organizer's local time)`;
+                : `${data.start_time}–${data.end_time} (${tz})`;
             document.querySelectorAll('.event-label').forEach(el => { el.textContent = labelText; });
             const aiEl = document.getElementById('ai-prompt-text');
             if (aiEl && data.ai_prompt) aiEl.textContent = data.ai_prompt;
