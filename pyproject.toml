@@ -5,6 +5,7 @@ description = "Templo — schedule polls and find a date everyone can make."
 requires-python = ">=3.11"
 dependencies = [
     "flask>=3.1.2",
+    "flask-wtf>=1.2.1",
     "gunicorn>=23.0.0",
     "python-dotenv>=1.1.1",
     "psycopg2-binary>=2.9.11",

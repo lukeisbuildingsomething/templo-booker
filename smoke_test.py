@@ -5,6 +5,7 @@ Run locally against a dev database, or automatically in CI (see
 non-zero if any check fails.
 """
 import os
+import re
 
 os.environ["SESSION_SECRET"] = "test-secret"
 os.environ["DATABASE_URL"] = "postgresql://postgres:test@localhost:55432/templo"
@@ -35,6 +36,28 @@ for path in ["/login", "/pricing", "/how-it-works", "/who-its-for", "/why-us", "
 # 404 handler
 r = c.get("/definitely-not-a-page")
 check("404 page", r.status_code == 404 and b"Page not found" in r.data)
+
+# --- CSRF protection (enabled by default via Flask-WTF) ---
+login_html = c.get("/login").get_data(as_text=True)
+check("csrf meta tag present", 'name="csrf-token"' in login_html)
+check("csrf form field present", 'name="csrf_token"' in login_html)
+# A tokenless form POST is rejected — the handler redirects (302) rather than
+# processing it.
+r = c.post("/contact", data={"name": "X", "email": "x@example.com", "message": "hi"})
+check("csrf blocks tokenless form POST", r.status_code == 302)
+# A tokenless AJAX POST (X-Requested-With) gets a 400 JSON error.
+r = c.post("/contact", data={"name": "X", "email": "x@example.com", "message": "hi"},
+           headers={"X-Requested-With": "XMLHttpRequest"})
+check("csrf blocks tokenless AJAX POST", r.status_code == 400)
+# A POST carrying a valid token is accepted.
+m = re.search(r'name="csrf-token" content="([^"]+)"', c.get("/contact").get_data(as_text=True))
+csrf = m.group(1) if m else ""
+r = c.post("/contact", data={"name": "X", "email": "x@example.com", "message": "hi", "csrf_token": csrf}, follow_redirects=True)
+check("csrf allows tokened POST", r.status_code == 200)
+
+# Disable CSRF for the remaining flow checks (they post JSON/forms without a
+# token, which is fine — CSRF enforcement itself is verified above).
+main.app.config["WTF_CSRF_ENABLED"] = False
 
 # Log in by simulating magic-link flow directly
 conn = main.get_db()

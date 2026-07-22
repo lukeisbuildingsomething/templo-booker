@@ -39,12 +39,14 @@
                     </button>
                     {% else %}
                     <form action="/poll/{{ poll.id }}/reopen" method="POST" onsubmit="return confirm('Reopen voting? This clears the confirmed dates.');">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <button type="submit" class="text-sm bg-amber-100 text-amber-700 py-2 px-4 rounded-lg hover:bg-amber-200 transition-colors font-medium">
                             Reopen Poll
                         </button>
                     </form>
                     {% endif %}
                     <form action="/poll/{{ poll.id }}/delete" method="POST" onsubmit="return confirm('Delete this poll?');">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <button type="submit" class="text-sm bg-red-100 text-red-600 py-2 px-4 rounded-lg hover:bg-red-200 transition-colors">
                             Delete
                         </button>

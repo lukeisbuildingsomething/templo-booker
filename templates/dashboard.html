@@ -75,6 +75,7 @@
                         Manage
                     </a>
                     <form action="/poll/{{ poll.id }}/delete" method="POST" onsubmit="return confirm('Delete this poll?');">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <button
                             type="submit"
                             class="bg-red-100 text-red-700 py-2 px-4 rounded-lg font-medium hover:bg-red-200 transition-colors text-sm"

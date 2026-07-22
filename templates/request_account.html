@@ -20,6 +20,7 @@
 
         <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-8">
             <form action="/request-account" method="POST" class="space-y-5">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <input type="hidden" name="form_token" value="{{ form_token }}">
                 <!-- Honeypot: hidden from real users, bots fill it and get silently dropped. -->
                 <div aria-hidden="true" style="position:absolute;left:-9999px;top:-9999px;height:0;width:0;overflow:hidden;" tabindex="-1">

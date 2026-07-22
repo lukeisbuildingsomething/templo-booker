@@ -20,6 +20,7 @@
         <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-8">
             <p class="text-sm text-gray-700 mb-5">Enter your email and we'll send you a one-click sign-in link. No password needed — we'll create your account on first use.</p>
             <form action="{{ url_for('poll_access', poll_id=poll.id) }}" method="POST" class="space-y-5">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <div>
                     <label for="email" class="block text-sm font-medium text-gray-700 mb-1.5">Email <span class="text-red-500">*</span></label>
                     <input

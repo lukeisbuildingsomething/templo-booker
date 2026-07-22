@@ -42,6 +42,7 @@
         <div id="uploadStatus" class="hidden mb-4 p-3 rounded-lg"></div>
         
         <form action="/profile" method="POST" class="space-y-6">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <input type="hidden" id="profile_picture" name="profile_picture" value="{{ user.profile_picture or '' }}">
             
             <div>

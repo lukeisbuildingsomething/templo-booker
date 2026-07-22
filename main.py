@@ -16,6 +16,7 @@ from flask import Flask, g, has_app_context, render_template, request, redirect,
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+from flask_wtf.csrf import CSRFProtect, CSRFError
 
 load_dotenv()
 
@@ -69,6 +70,30 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "1").lower() in ("1", "true", "yes"),
 )
+
+# CSRF protection for all state-changing (POST/PUT/PATCH/DELETE) requests.
+# Server-rendered forms carry {{ csrf_token() }} in a hidden field; AJAX calls
+# send the token in the X-CSRFToken header (read from the <meta> tag). GET
+# requests, and the magic-link / ICS routes (all GET), are unaffected.
+#   * SSL_STRICT off: the signed session-bound token is the real defense;
+#     requiring a Referer header too would wrongly block users whose browser
+#     strips it (privacy settings / Referrer-Policy: no-referrer).
+#   * TIME_LIMIT None: tokens live for the session, so a page left open (e.g.
+#     the vote page) doesn't fail with an expired token.
+app.config["WTF_CSRF_SSL_STRICT"] = False
+app.config["WTF_CSRF_TIME_LIMIT"] = None
+csrf = CSRFProtect(app)
+
+
+@app.errorhandler(CSRFError)
+def handle_csrf_error(e):
+    # AJAX callers (which set X-Requested-With) get JSON; form posts get a
+    # friendly flash + redirect back rather than a raw 400 page.
+    if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        return jsonify({"error": "Your session expired. Refresh the page and try again."}), 400
+    flash("Your session expired. Please try that again.", "error")
+    return redirect(request.referrer or url_for("home"))
+
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
