@@ -1,7 +1,7 @@
-import base64
 import os
 import random
 import re
+from functools import wraps
 import string
 import secrets
 from pathlib import Path
@@ -24,8 +24,40 @@ if not app.secret_key:
     raise RuntimeError("SESSION_SECRET environment variable is required")
 app.permanent_session_lifetime = timedelta(days=30)
 
-# Signs the contact-form timing token used for spam protection.
-contact_form_serializer = URLSafeTimedSerializer(app.secret_key, salt="contact-form")
+# Signs the timing token used for public-form spam protection (contact,
+# account requests). The token's payload names the form it was issued for.
+form_token_serializer = URLSafeTimedSerializer(app.secret_key, salt="form-token")
+
+
+def issue_form_token(purpose):
+    """A signed token embedding the issue time, for a named public form."""
+    return form_token_serializer.dumps(purpose)
+
+
+def submission_looks_like_bot(purpose, min_fill_seconds=3, max_age_seconds=60 * 60 * 6):
+    """Heuristic bot check for a public form POST.
+
+    Returns True only on confident automated signals:
+      * the hidden honeypot ``website`` field was filled, or
+      * a validly-signed token for this form came back implausibly fast.
+    A missing/forged/expired token is NOT treated as a bot — a real person can
+    leave the page open past the token lifetime, or a proxy can strip the hidden
+    field — so those submissions still go through rather than being lost.
+    """
+    if request.form.get("website", "").strip():
+        return True
+    try:
+        payload, issued_at = form_token_serializer.loads(
+            request.form.get("form_token", ""),
+            max_age=max_age_seconds,
+            return_timestamp=True,
+        )
+        elapsed = (datetime.now(timezone.utc) - issued_at).total_seconds()
+        if payload == purpose and elapsed < min_fill_seconds:
+            return True
+    except (BadSignature, SignatureExpired, ValueError):
+        pass
+    return False
 
 # Railway terminates TLS at its proxy; trust X-Forwarded-* so request.url_root
 # and generated links (magic-link emails) use https and the public host.
@@ -165,6 +197,16 @@ def _ics_escape(value):
         .replace("\r\n", "\\n")
         .replace("\n", "\\n")
     )
+
+
+def _ics_mailto(email):
+    """Sanitize an address for use in an ICS mailto: value.
+
+    Strips any control/whitespace characters so an address can never break out
+    of its calendar property line (CRLF injection). Emails are already
+    normalized upstream, but this makes the ICS builder safe by construction.
+    """
+    return re.sub(r"[\s\x00-\x1f\x7f]", "", str(email or ""))
 
 
 def _parse_hhmm(value):
@@ -307,7 +349,7 @@ def generate_ics(poll, date_row, attendees, organizer_email, organizer_name, sen
         description_text = "Confirmed via Templo. " + (poll.get('name') or '')
 
     organizer_line = (
-        f"ORGANIZER;CN={_ics_escape(cal_organizer_name)}:mailto:{cal_organizer_email}"
+        f"ORGANIZER;CN={_ics_escape(cal_organizer_name)}:mailto:{_ics_mailto(cal_organizer_email)}"
     )
 
     lines = [
@@ -332,7 +374,7 @@ def generate_ics(poll, date_row, attendees, organizer_email, organizer_name, sen
             continue
         cn = _ics_escape(get_name(attendee) or attendee)
         lines.append(
-            f"ATTENDEE;CN={cn};RSVP=TRUE;PARTSTAT=NEEDS-ACTION;ROLE=REQ-PARTICIPANT:mailto:{attendee}"
+            f"ATTENDEE;CN={cn};RSVP=TRUE;PARTSTAT=NEEDS-ACTION;ROLE=REQ-PARTICIPANT:mailto:{_ics_mailto(attendee)}"
         )
     lines.append("END:VEVENT")
     lines.append("END:VCALENDAR")
@@ -470,30 +512,33 @@ def is_valid_date_string(value):
         return False
 
 
-def get_name(email):
-    if email:
-        normalized_email = normalize_email(email)
-        # First check if user has a custom display_name in database
-        try:
-            conn = get_db()
-            cursor = conn.cursor(cursor_factory=RealDictCursor)
-            cursor.execute("SELECT display_name FROM users WHERE email = %s", (normalized_email,))
-            user = cursor.fetchone()
-            conn.close()
-            if user and user.get("display_name"):
-                return user["display_name"]
-        except:
-            pass
-        return EMAIL_TO_NAME.get(normalized_email, normalized_email.split('@')[0])
-    return ""
+def _request_cache():
+    """A dict scoped to the current request, or None outside a request context.
+
+    Used to memoize read-only user lookups so a single page render (e.g. the
+    vote page, which resolves display names in nested per-date/per-participant
+    loops) doesn't open a fresh Postgres connection for every call.
+    """
+    if not has_app_context():
+        return None
+    cache = getattr(g, "_req_cache", None)
+    if cache is None:
+        cache = {}
+        g._req_cache = cache
+    return cache
 
 
 def get_user_profile(email):
-    """Get full user profile including profile picture"""
+    """Get full user profile including profile picture (cached per request)."""
     if not email:
         return None
+    normalized_email = normalize_email(email)
+    cache = _request_cache()
+    cache_key = "profile:" + normalized_email
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+    user = None
     try:
-        normalized_email = normalize_email(email)
         conn = get_db()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         cursor.execute(
@@ -502,9 +547,30 @@ def get_user_profile(email):
         )
         user = cursor.fetchone()
         conn.close()
-        return user
-    except:
+    except Exception as e:
+        print(f"ERROR: get_user_profile({normalized_email}) failed: {e}")
         return None
+    if cache is not None:
+        cache[cache_key] = user
+    return user
+
+
+def invalidate_user_cache(email):
+    """Drop a cached profile after the user row is updated within a request."""
+    cache = _request_cache()
+    if cache is not None:
+        cache.pop("profile:" + normalize_email(email), None)
+
+
+def get_name(email):
+    if not email:
+        return ""
+    normalized_email = normalize_email(email)
+    # Reuse the per-request-cached profile lookup for the display name.
+    profile = get_user_profile(normalized_email)
+    if profile and profile.get("display_name"):
+        return profile["display_name"]
+    return EMAIL_TO_NAME.get(normalized_email, normalized_email.split('@')[0])
 
 
 def is_allowed_email(email):
@@ -523,7 +589,10 @@ def is_allowed_email(email):
         user_exists = cursor.fetchone() is not None
         conn.close()
         return user_exists
-    except:
+    except Exception as e:
+        # Fail closed on a DB error (safer for access control), but log it so
+        # a transient outage isn't silently mistaken for "no such account".
+        print(f"ERROR: is_allowed_email({normalized}) failed: {e}")
         return False
 
 
@@ -636,6 +705,22 @@ def is_admin_user(user):
     return bool(user and user.get("role") == "admin")
 
 
+def admin_required(view):
+    """Gate a view behind admin access, redirecting non-admins to the dashboard.
+
+    Replaces the get_current_user()/is_admin_user()/flash/redirect block that
+    was copy-pasted across every /admin route. The view can still call
+    get_current_user() itself (cheap — it's request-cached).
+    """
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        if not is_admin_user(get_current_user()):
+            flash("Admin access required.", "error")
+            return redirect(url_for("dashboard"))
+        return view(*args, **kwargs)
+    return wrapper
+
+
 def user_can_manage_poll(user, poll):
     if not user or not poll:
         return False
@@ -707,6 +792,8 @@ def delete_poll_records(cursor, poll_id):
         cursor.execute("DELETE FROM votes WHERE date_id = %s", (date_id,))
 
     cursor.execute("DELETE FROM dates WHERE poll_id = %s", (poll_id,))
+    # Clean up magic links tied to this poll so no orphaned rows linger.
+    cursor.execute("DELETE FROM magic_links WHERE poll_id = %s", (poll_id,))
     cursor.execute("DELETE FROM polls WHERE id = %s", (poll_id,))
 
 
@@ -824,8 +911,8 @@ def init_db():
                 "UPDATE users SET role = 'admin', tier = 'paid' WHERE LOWER(email) = %s",
                 (admin_email,)
             )
-    except:
-        pass
+    except Exception as e:
+        print(f"WARNING: users migration: {e}")
     
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS verification_tokens (
@@ -889,8 +976,8 @@ def utility_processor():
             cursor.execute("SELECT COUNT(*) FROM account_requests WHERE status = 'pending'")
             pending_request_count = cursor.fetchone()[0]
             conn.close()
-        except:
-            pass
+        except Exception as e:
+            print(f"ERROR: pending request count failed: {e}")
     return dict(
         get_name=get_name,
         current_user=current_user,
@@ -1055,8 +1142,13 @@ def finalize_poll():
     if any(not is_valid_date_string(date_str) for date_str in selected_dates):
         return jsonify({"error": "One or more selected dates are invalid."}), 400
 
-    today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if any(date_str < today_iso for date_str in selected_dates):
+    # Floor at "yesterday in UTC" rather than "today in UTC": the organizer's
+    # dates are in their own local timezone, which can be up to a full calendar
+    # day behind UTC (e.g. the Americas in the evening). Using today-in-UTC
+    # would wrongly reject a same-day booking for those users. Yesterday-in-UTC
+    # still rejects genuinely past dates while accepting every valid local today.
+    earliest_iso = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    if any(date_str < earliest_iso for date_str in selected_dates):
         return jsonify({"error": "Past dates are not allowed."}), 400
 
     if current_user["tier"] == "free":
@@ -1405,7 +1497,7 @@ def magic_login(token):
         '''SELECT * FROM magic_links
            WHERE token = %s
              AND expires_at > NOW()
-             AND (used_at IS NULL OR used_at > NOW() - INTERVAL '10 minutes')''',
+             AND (used_at IS NULL OR used_at > NOW() - INTERVAL '60 seconds')''',
         (token,)
     )
     link = cursor.fetchone()
@@ -1795,11 +1887,9 @@ def upgrade():
 
 
 @app.route("/admin")
+@admin_required
 def admin_panel():
     current_user = get_current_user()
-    if not is_admin_user(current_user):
-        flash("Admin access required.", "error")
-        return redirect(url_for("dashboard"))
 
     conn = get_db()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
@@ -1864,11 +1954,9 @@ def admin_panel():
 
 
 @app.route("/admin/users/<path:target_email>/update", methods=["POST"])
+@admin_required
 def admin_update_user(target_email):
     current_user = get_current_user()
-    if not is_admin_user(current_user):
-        flash("Admin access required.", "error")
-        return redirect(url_for("dashboard"))
 
     target_email = normalize_email(target_email)
     role = (request.form.get("role") or "").strip().lower()
@@ -1918,11 +2006,9 @@ def admin_update_user(target_email):
 
 
 @app.route("/admin/polls/<poll_id>/delete", methods=["POST"])
+@admin_required
 def admin_delete_poll(poll_id):
     current_user = get_current_user()
-    if not is_admin_user(current_user):
-        flash("Admin access required.", "error")
-        return redirect(url_for("dashboard"))
 
     conn = get_db()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
@@ -1943,11 +2029,9 @@ def admin_delete_poll(poll_id):
 
 
 @app.route("/admin/users/<path:target_email>/send-magic-link", methods=["POST"])
+@admin_required
 def admin_send_magic_link(target_email):
     current_user = get_current_user()
-    if not is_admin_user(current_user):
-        flash("Admin access required.", "error")
-        return redirect(url_for("dashboard"))
 
     email = normalize_email(target_email)
     if not email or "@" not in email:
@@ -1988,11 +2072,9 @@ def admin_send_magic_link(target_email):
 
 
 @app.route("/admin/email/save", methods=["POST"])
+@admin_required
 def admin_save_email_settings():
     current_user = get_current_user()
-    if not is_admin_user(current_user):
-        flash("Admin access required.", "error")
-        return redirect(url_for("dashboard"))
 
     api_key = (request.form.get("mailersend_api_key") or "").strip()
     from_name = (request.form.get("mail_from_name") or "").strip()
@@ -2010,11 +2092,9 @@ def admin_save_email_settings():
 
 
 @app.route("/admin/email/clear", methods=["POST"])
+@admin_required
 def admin_clear_email_key():
     current_user = get_current_user()
-    if not is_admin_user(current_user):
-        flash("Admin access required.", "error")
-        return redirect(url_for("dashboard"))
     set_setting("mailersend_api_key", "")
     flash("MailerSend API key cleared.", "success")
     return redirect(url_for("admin_panel") + "#email-settings")
@@ -2035,6 +2115,12 @@ def request_account():
         return redirect(url_for("dashboard"))
 
     if request.method == "POST":
+        # Spam protection: silently accept automated-looking submissions so a
+        # bot can't flood every admin inbox by cycling through unique emails.
+        if submission_looks_like_bot("request-account"):
+            flash("Your request has been submitted! You'll receive an email once an admin approves your account.", "success")
+            return redirect(url_for("request_account"))
+
         email = normalize_email(request.form.get("email", ""))
         name = request.form.get("name", "").strip()
         reason = request.form.get("reason", "").strip()
@@ -2094,7 +2180,8 @@ def request_account():
     return render_template(
         "request_account.html",
         prefill_email=prefill_email,
-        requested_poll=requested_poll
+        requested_poll=requested_poll,
+        form_token=issue_form_token("request-account"),
     )
 
 
@@ -2152,11 +2239,9 @@ def approve_request_via_email(token):
 
 
 @app.route("/admin/requests/<int:request_id>/approve", methods=["POST"])
+@admin_required
 def admin_approve_request(request_id):
     current_user = get_current_user()
-    if not is_admin_user(current_user):
-        flash("Admin access required.", "error")
-        return redirect(url_for("dashboard"))
 
     conn = get_db()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
@@ -2204,11 +2289,9 @@ def admin_approve_request(request_id):
 
 
 @app.route("/admin/requests/<int:request_id>/reject", methods=["POST"])
+@admin_required
 def admin_reject_request(request_id):
     current_user = get_current_user()
-    if not is_admin_user(current_user):
-        flash("Admin access required.", "error")
-        return redirect(url_for("dashboard"))
 
     conn = get_db()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
@@ -2325,6 +2408,7 @@ def profile():
             )
         )
         conn.commit()
+        invalidate_user_cache(current_email)
         flash("Profile updated successfully!", "success")
     
     cursor.execute("SELECT email, display_name, profile_picture FROM users WHERE email = %s", (normalize_email(user_email),))
@@ -2422,26 +2506,9 @@ def marketing_why_us():
 @app.route("/contact", methods=["GET", "POST"])
 def marketing_contact():
     if request.method == "POST":
-        # --- Spam protection (fails silently so bots don't learn to adapt) ---
-        # 1. Honeypot: a hidden field real users never see. Bots auto-fill it.
-        if request.form.get("website", "").strip():
-            flash("Message sent! We'll get back to you soon.", "success")
-            return redirect(url_for("marketing_contact"))
-
-        # 2. Timing trap: a signed token issued when the page loaded. Reject
-        #    submissions completed implausibly fast (bots submit instantly) or
-        #    with a missing/forged/stale token.
-        MIN_FILL_SECONDS = 3
-        MAX_FORM_AGE_SECONDS = 60 * 60 * 6  # 6h — token effectively expires
-        token = request.form.get("form_token", "")
-        try:
-            _, issued_at = contact_form_serializer.loads(
-                token, max_age=MAX_FORM_AGE_SECONDS, return_timestamp=True
-            )
-            elapsed = (datetime.now(timezone.utc) - issued_at).total_seconds()
-        except (BadSignature, SignatureExpired, ValueError):
-            elapsed = -1
-        if elapsed < MIN_FILL_SECONDS:
+        # Spam protection: silently accept (so bots don't learn to adapt) when
+        # the submission looks automated. Genuine messages always go through.
+        if submission_looks_like_bot("contact"):
             flash("Message sent! We'll get back to you soon.", "success")
             return redirect(url_for("marketing_contact"))
 
@@ -2479,7 +2546,7 @@ def marketing_contact():
 
     return render_template(
         "marketing_contact.html",
-        form_token=contact_form_serializer.dumps("contact"),
+        form_token=issue_form_token("contact"),
     )
 
 

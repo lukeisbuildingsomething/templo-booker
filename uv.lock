@@ -359,6 +359,8 @@ source = { virtual = "." }
 dependencies = [
     { name = "flask" },
     { name = "gunicorn" },
+    { name = "itsdangerous" },
+    { name = "markupsafe" },
     { name = "psycopg2-binary" },
     { name = "python-dotenv" },
     { name = "requests" },
@@ -369,6 +371,8 @@ dependencies = [
 requires-dist = [
     { name = "flask", specifier = ">=3.1.2" },
     { name = "gunicorn", specifier = ">=23.0.0" },
+    { name = "itsdangerous", specifier = ">=2.2.0" },
+    { name = "markupsafe", specifier = ">=3.0.0" },
     { name = "psycopg2-binary", specifier = ">=2.9.11" },
     { name = "python-dotenv", specifier = ">=1.1.1" },
     { name = "requests", specifier = ">=2.32.5" },

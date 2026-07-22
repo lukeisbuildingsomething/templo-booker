@@ -1,4 +1,9 @@
-"""Throwaway end-to-end smoke test against a local Postgres. Not shipped."""
+"""End-to-end smoke test against a Postgres instance.
+
+Run locally against a dev database, or automatically in CI (see
+.github/workflows/ci.yml, which provisions a postgres:16 service). Exits
+non-zero if any check fails.
+"""
 import os
 
 os.environ["SESSION_SECRET"] = "test-secret"
@@ -122,9 +127,32 @@ check("admin panel", c.get("/admin").status_code == 200)
 r = c.post("/profile", data={"display_name": "Admin", "email": "admin@example.com", "profile_picture": "javascript:alert(1)"}, follow_redirects=True)
 check("reject javascript: picture", b"must be an http(s) URL" in r.data)
 
-# Contact form (email send fails gracefully w/o API key)
+# Contact form: a genuine message (no timing token) flows through validation
+# and the send path (which fails gracefully without an API key) → success.
 r = c.post("/contact", data={"name": "Bob", "email": "bob@example.com", "subject": "hi", "message": "hello"}, follow_redirects=True)
-check("contact form", r.status_code == 200)
+check("contact form (genuine message delivered)", r.status_code == 200)
+# Honeypot-filled submission is silently accepted (bot) — still 200, never errors.
+r = c.post("/contact", data={"name": "Bot", "email": "bot@example.com", "message": "spam", "website": "http://spam.example"}, follow_redirects=True)
+check("contact form (honeypot silently accepted)", r.status_code == 200)
+
+# Account request: honeypot silently accepted; genuine request is recorded.
+c3 = app.test_client()
+r = c3.post("/request-account", data={"email": "newbie@example.com", "name": "Newbie", "reason": "please", "website": "x"}, follow_redirects=True)
+check("request-account (honeypot silently accepted)", r.status_code == 200)
+conn = main.get_db()
+cur = conn.cursor()
+cur.execute("SELECT COUNT(*) FROM account_requests WHERE LOWER(email) = 'newbie@example.com'")
+honeypot_count = cur.fetchone()[0]
+conn.close()
+check("request-account honeypot created no request row", honeypot_count == 0)
+r = c3.post("/request-account", data={"email": "realuser@example.com", "name": "Real", "reason": "please"}, follow_redirects=True)
+check("request-account (genuine request accepted)", r.status_code == 200)
+conn = main.get_db()
+cur = conn.cursor()
+cur.execute("SELECT COUNT(*) FROM account_requests WHERE LOWER(email) = 'realuser@example.com' AND status = 'pending'")
+real_count = cur.fetchone()[0]
+conn.close()
+check("request-account genuine request recorded", real_count == 1)
 
 # Delete poll
 r = c.post(f"/poll/{poll_id}/delete", follow_redirects=False)

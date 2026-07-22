@@ -24,8 +24,11 @@ venv/
 ENV/
 env/
 *.db
+# Ignore every env file variant (incl. .env.local, .env.local.bak, .env.prod, …)
+# so a stray backup can never be committed with real secrets.
 .env
-.env.local
+.env.*
+*.bak
 *.log
 .DS_Store
 static/uploads/
