@@ -1,7 +1,6 @@
 """End-to-end smoke test against a Postgres instance.
 
-Run locally against a dev database, or automatically in CI (see
-.github/workflows/ci.yml, which provisions a postgres:16 service). Exits
+Run via scripts/validate-local.sh against its fresh local postgres:16 service. Exits
 non-zero if any check fails.
 """
 import os
