@@ -71,3 +71,7 @@ Notes:
 - The app crashes at boot if the database is unreachable (`init_db()` runs at import). If the app is down, check the Postgres service first.
 - Useful CLI: `railway logs --service DiamondDogsScheduler`, `railway redeploy --service <name> --from-source -y`
 - After first deploy, sign in with an `ADMIN_EMAILS` address and set the MailerSend API key in Admin → Email, or magic-link emails won't send.
+
+## Local validation (no GitHub Actions)
+
+See [validation and release status](docs/local-validation.md).
