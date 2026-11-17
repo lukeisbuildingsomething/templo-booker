@@ -199,6 +199,7 @@
                     <tr class="text-left text-gray-500 border-b">
                         <th class="py-2 pr-4">User</th>
                         <th class="py-2 pr-4">Verified</th>
+                        <th class="py-2 pr-4">Organizer</th>
                         <th class="py-2 pr-4">Owned Polls</th>
                         <th class="py-2 pr-4">Role</th>
                         <th class="py-2 pr-4">Tier</th>
@@ -217,6 +218,12 @@
                             <label class="inline-flex items-center gap-2 cursor-pointer">
                                 <input type="checkbox" name="is_verified" form="{{ form_id }}" {% if user.is_verified %}checked{% endif %} class="rounded">
                                 <span class="text-xs {% if user.is_verified %}text-green-700{% else %}text-gray-500{% endif %}">{% if user.is_verified %}Yes{% else %}No{% endif %}</span>
+                            </label>
+                        </td>
+                        <td class="py-3 pr-4">
+                            <label class="inline-flex items-center gap-2">
+                                <input type="checkbox" name="is_approved" form="{{ form_id }}" {% if user.is_approved %}checked{% endif %} class="rounded">
+                                <span class="text-xs">Approved</span>
                             </label>
                         </td>
                         <td class="py-3 pr-4">{{ user.owned_poll_count }}</td>
@@ -255,6 +262,19 @@
                 </tbody>
             </table>
         </div>
+    </section>
+
+    <section class="bg-white rounded-xl shadow p-6">
+        <h2 class="text-lg font-semibold text-gray-900 mb-4">Contact messages</h2>
+        <p class="text-sm text-gray-500 mb-4">Latest 100 submissions. Messages are saved here even when email notifications fail.</p>
+        {% for message in contact_messages %}
+        <details class="border-t border-gray-200 py-3">
+            <summary class="cursor-pointer text-sm font-medium text-gray-900">{{ message.subject or 'General inquiry' }} — {{ message.name }} ({{ message.email }})
+                <span class="text-xs text-gray-500">{{ message.created_at.strftime('%b %d, %Y %H:%M') }} · {{ 'Email delivered' if message.delivered_at else 'Email notification failed' }}</span>
+            </summary>
+            <p class="mt-3 text-sm text-gray-700 whitespace-pre-wrap">{{ message.message }}</p>
+        </details>
+        {% else %}<p class="text-sm text-gray-500">No contact messages yet.</p>{% endfor %}
     </section>
 
     <section class="bg-white rounded-xl shadow p-6">

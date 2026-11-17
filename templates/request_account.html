@@ -8,13 +8,13 @@
 <section class="py-12 lg:py-20">
     <div class="max-w-lg mx-auto px-4 sm:px-6 lg:px-8">
         <div class="text-center mb-8">
-            <h1 class="text-3xl sm:text-4xl font-extrabold tracking-tight mb-3">Get started with Templo</h1>
-            <p class="text-gray-600">Fill out the form below and you'll get access once approved. Usually within a few hours.</p>
+            <h1 class="text-3xl sm:text-4xl font-extrabold tracking-tight mb-3">Request organizer access</h1>
+            <p class="text-gray-600">You can vote using a poll link. To create your own polls, submit this form for approval. Usually within a few hours.</p>
         </div>
 
         {% if requested_poll %}
         <div class="bg-brand-50 border border-brand-200 rounded-xl p-4 mb-6 text-sm text-brand-900">
-            That email isn't on the invite list for <strong>{{ requested_poll.name }}</strong>. Submit this request and the poll owner can let you in.
+            Want to create polls like <strong>{{ requested_poll.name }}</strong>? Request organizer access below. For access to an invite-only poll, ask its owner to add your email.
         </div>
         {% endif %}
 

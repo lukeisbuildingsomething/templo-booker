@@ -5,6 +5,7 @@ from functools import wraps
 import string
 import secrets
 from pathlib import Path
+from urllib.parse import urlsplit
 import psycopg2
 import requests
 from dotenv import load_dotenv
@@ -61,9 +62,19 @@ def submission_looks_like_bot(purpose, min_fill_seconds=3, max_age_seconds=60 * 
         pass
     return False
 
-# Railway terminates TLS at its proxy; trust X-Forwarded-* so request.url_root
-# and generated links (magic-link emails) use https and the public host.
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+# Railway terminates TLS. Never trust a forwarded host when building email links.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+public_base_url = os.environ.get("PUBLIC_BASE_URL", "https://templobooker.com").rstrip("/")
+public_origin = urlsplit(public_base_url)
+if (public_origin.scheme not in {"http", "https"} or not public_origin.hostname
+        or public_origin.username or public_origin.password or public_origin.path
+        or public_origin.query or public_origin.fragment):
+    raise RuntimeError("PUBLIC_BASE_URL must be an http(s) origin without a path")
+app.config["PUBLIC_BASE_URL"] = public_base_url
+
+
+def public_url(endpoint, **values):
+    return app.config["PUBLIC_BASE_URL"] + url_for(endpoint, _external=False, **values)
 
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
@@ -616,7 +627,7 @@ def get_user_profile(email):
         conn = get_db()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         cursor.execute(
-            "SELECT email, display_name, profile_picture, role, tier, is_verified FROM users WHERE email = %s",
+            "SELECT id, email, display_name, profile_picture, role, tier, is_verified, is_approved FROM users WHERE email = %s",
             (normalized_email,)
         )
         user = cursor.fetchone()
@@ -655,11 +666,11 @@ def is_allowed_email(email):
     # Legacy allowlist
     if normalized in [normalize_email(e) for e in ALLOWED_EMAILS]:
         return True
-    # Check if user exists in database (approved via account request flow)
+    # Email verification for voting does not grant organizer approval.
     try:
         conn = get_db()
         cursor = conn.cursor()
-        cursor.execute("SELECT id FROM users WHERE LOWER(email) = %s", (normalized,))
+        cursor.execute("SELECT id FROM users WHERE LOWER(email) = %s AND is_approved = TRUE", (normalized,))
         user_exists = cursor.fetchone() is not None
         conn.close()
         return user_exists
@@ -698,9 +709,9 @@ def magic_link_rate_limited(cursor, email):
     return count >= MAGIC_LINKS_PER_HOUR
 
 
-def send_admin_request_notification(requester_email, requester_name, reason, approval_token, request_url_root):
-    approve_url = request_url_root.rstrip("/") + url_for("approve_request_via_email", token=approval_token)
-    admin_url = request_url_root.rstrip("/") + url_for("admin_panel")
+def send_admin_request_notification(requester_email, requester_name, reason, approval_token):
+    approve_url = public_url("approve_request_via_email", token=approval_token)
+    admin_url = public_url("admin_panel")
     display_name = requester_name or requester_email.split("@")[0]
     reason_html = f"<p><strong>Reason:</strong> {escape(reason)}</p>" if reason else ""
 
@@ -724,8 +735,8 @@ def send_admin_request_notification(requester_email, requester_name, reason, app
     return True
 
 
-def send_magic_link_email(to_email, token, poll, request_url_root):
-    magic_url = request_url_root.rstrip("/") + url_for("magic_login", token=token)
+def send_magic_link_email(to_email, token, poll):
+    magic_url = public_url("magic_login", token=token)
 
     if poll:
         poll_name = poll.get("name") or "your poll"
@@ -760,14 +771,7 @@ def get_current_user():
 
     user = get_user_profile(user_email)
     if not user:
-        return {
-            "email": user_email,
-            "display_name": None,
-            "profile_picture": None,
-            "role": default_role_for_email(user_email),
-            "tier": default_tier_for_email(user_email),
-            "is_verified": False
-        }
+        return None
 
     user["email"] = normalize_email(user["email"])
     user["role"] = (user.get("role") or default_role_for_email(user["email"])).lower()
@@ -777,6 +781,27 @@ def get_current_user():
 
 def is_admin_user(user):
     return bool(user and user.get("role") == "admin")
+
+
+def can_create_polls(user):
+    return bool(user and (user.get("is_approved") or is_admin_user(user)))
+
+
+def organizer_required(view):
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            if request.is_json:
+                return jsonify({"error": "Please sign in.", "needs_login": True}), 401
+            return redirect(url_for("login"))
+        if not can_create_polls(user):
+            if request.is_json:
+                return jsonify({"error": "Request an organizer account before creating polls."}), 403
+            flash("You can vote now. Request an organizer account to create polls.", "error")
+            return redirect(url_for("request_account"))
+        return view(*args, **kwargs)
+    return wrapper
 
 
 def admin_required(view):
@@ -854,7 +879,22 @@ def get_owned_poll_count(email):
     return count
 
 
+def active_poll_limit_reached(cursor, email):
+    """Serialize creation/reopening for one owner and check quota in that transaction."""
+    cursor.execute("SELECT role, tier FROM users WHERE LOWER(email) = %s FOR UPDATE", (normalize_email(email),))
+    owner = cursor.fetchone()
+    if not owner:
+        return True
+    role, tier = (owner["role"], owner["tier"]) if isinstance(owner, dict) else owner
+    if role == "admin" or tier == "paid":
+        return False
+    cursor.execute("SELECT COUNT(*) FROM polls WHERE LOWER(admin_email) = %s AND closed_at IS NULL", (normalize_email(email),))
+    row = cursor.fetchone()
+    return (row["count"] if isinstance(row, dict) else row[0]) >= FREE_POLL_LIMIT
+
+
 def delete_poll_records(cursor, poll_id):
+    cursor.execute("SELECT id FROM polls WHERE id = %s FOR UPDATE", (poll_id,))
     cursor.execute("SELECT id FROM dates WHERE poll_id = %s", (poll_id,))
     date_rows = cursor.fetchall()
     date_ids = [
@@ -877,7 +917,7 @@ def sync_admin_account(conn, email):
         return
     cursor = conn.cursor()
     cursor.execute(
-        "UPDATE users SET role = 'admin', tier = 'paid' WHERE LOWER(email) = %s",
+        "UPDATE users SET role = 'admin', tier = 'paid', is_approved = TRUE WHERE LOWER(email) = %s",
         (normalized_email,)
     )
 
@@ -965,6 +1005,7 @@ def init_db():
             email TEXT UNIQUE NOT NULL,
             password_hash TEXT,
             is_verified BOOLEAN DEFAULT FALSE,
+            is_approved BOOLEAN NOT NULL DEFAULT FALSE,
             role TEXT DEFAULT 'user',
             tier TEXT DEFAULT 'free',
             display_name TEXT,
@@ -979,6 +1020,7 @@ def init_db():
         cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_picture TEXT")
         cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'user'")
         cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS tier TEXT DEFAULT 'free'")
+        cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_approved BOOLEAN")
         cursor.execute("UPDATE users SET role = 'user' WHERE role IS NULL OR role = ''")
         cursor.execute("UPDATE users SET tier = 'free' WHERE tier IS NULL OR tier = ''")
         for admin_email in ADMIN_EMAILS:
@@ -1025,6 +1067,38 @@ def init_db():
         )
     ''')
 
+    # Backfill only pre-migration rows. Verified voters without approval evidence
+    # remain participants; existing organizers retain their ability to create.
+    cursor.execute('''
+        UPDATE users u SET is_approved = (
+            u.role = 'admin' OR LOWER(u.email) = ANY(%s)
+            OR EXISTS (SELECT 1 FROM account_requests r WHERE LOWER(r.email) = LOWER(u.email) AND r.status = 'approved')
+            OR EXISTS (SELECT 1 FROM polls p WHERE LOWER(p.admin_email) = LOWER(u.email))
+        ) WHERE u.is_approved IS NULL
+    ''', (sorted(ADMIN_EMAILS | {normalize_email(e) for e in ALLOWED_EMAILS}),))
+    cursor.execute("ALTER TABLE users ALTER COLUMN is_approved SET DEFAULT FALSE")
+    cursor.execute("ALTER TABLE users ALTER COLUMN is_approved SET NOT NULL")
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS email_changes (
+            user_id INTEGER PRIMARY KEY REFERENCES users(id),
+            new_email TEXT NOT NULL,
+            token TEXT UNIQUE NOT NULL,
+            expires_at TIMESTAMP NOT NULL
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS contact_messages (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            message TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            delivered_at TIMESTAMP
+        )
+    ''')
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS app_settings (
             key TEXT PRIMARY KEY,
@@ -1057,6 +1131,7 @@ def utility_processor():
         get_name=get_name,
         current_user=current_user,
         is_admin=is_admin_user(current_user),
+        can_organize=can_create_polls(current_user),
         pending_request_count=pending_request_count
     )
 
@@ -1077,7 +1152,7 @@ def login():
             flash("Please enter a valid email address.", "error")
             return redirect(url_for("login"))
 
-        if not is_allowed_email(email):
+        if not is_allowed_email(email) and not get_user_profile(email):
             flash("No account found for this email. Please request access first.", "error")
             return redirect(url_for("request_account", email=email))
 
@@ -1091,8 +1166,8 @@ def login():
             return redirect(url_for("login"))
 
         cursor.execute(
-            "INSERT INTO users (email, role, tier) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
-            (email, default_role_for_email(email), default_tier_for_email(email))
+            "INSERT INTO users (email, role, tier, is_approved) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
+            (email, default_role_for_email(email), default_tier_for_email(email), is_allowed_email(email))
         )
         sync_admin_account(conn, email)
 
@@ -1104,7 +1179,7 @@ def login():
         conn.commit()
         conn.close()
 
-        sent, error = send_magic_link_email(email, token, None, request.url_root)
+        sent, error = send_magic_link_email(email, token, None)
         if sent:
             flash(f"Check your inbox — we've sent a sign-in link to {email}.", "success")
         else:
@@ -1123,6 +1198,7 @@ def verify_email(token):
 
 
 @app.route("/create")
+@organizer_required
 def create_poll():
     current_user = get_current_user()
 
@@ -1144,6 +1220,7 @@ def create_poll():
 
 
 @app.route("/create", methods=["POST"])
+@organizer_required
 def create_poll_step1():
     current_user = get_current_user()
     if not current_user:
@@ -1172,6 +1249,7 @@ def create_poll_step1():
 
 
 @app.route("/calendar")
+@organizer_required
 def calendar_view():
     current_user = get_current_user()
     if not current_user:
@@ -1197,6 +1275,7 @@ def calendar_view():
 
 
 @app.route("/finalize", methods=["POST"])
+@organizer_required
 def finalize_poll():
     current_user = get_current_user()
     if not current_user:
@@ -1229,12 +1308,12 @@ def finalize_poll():
     if current_user["tier"] == "free":
         if len(selected_dates) > FREE_DATE_LIMIT:
             return jsonify({"error": f"Free tier allows up to {FREE_DATE_LIMIT} dates per poll."}), 400
-        owned_poll_count = get_owned_poll_count(current_user["email"])
-        if owned_poll_count >= FREE_POLL_LIMIT:
-            return jsonify({"error": "Free tier allows 1 active poll at a time. Close or delete your existing poll, or upgrade."}), 400
     
     conn = get_db()
     cursor = conn.cursor()
+    if active_poll_limit_reached(cursor, current_user["email"]):
+        conn.close()
+        return jsonify({"error": "Free tier allows 1 active poll at a time. Close or delete your existing poll, or upgrade."}), 400
 
     poll_id = generate_short_id()
     cursor.execute("SELECT 1 FROM polls WHERE id = %s", (poll_id,))
@@ -1324,7 +1403,7 @@ def share_poll(poll_id):
 
     conn.close()
 
-    base_url = request.url_root.rstrip("/")
+    base_url = app.config["PUBLIC_BASE_URL"]
     if poll.get("slug"):
         poll_url = base_url + "/p/" + poll["slug"]
     else:
@@ -1350,6 +1429,7 @@ def update_invite_emails(poll_id):
     emails = data.get("emails", "")
     poll_name = (data.get("name") or "").strip()
     access_mode = (data.get("access_mode") or "").strip().lower()
+    has_slug = "slug" in data
     slug = (data.get("slug") or "").strip().lower() or None
 
     if poll_name and len(poll_name) > 120:
@@ -1372,7 +1452,7 @@ def update_invite_emails(poll_id):
 
     invite_text = serialize_invite_emails(parse_invite_emails(emails))
 
-    if slug is not None:
+    if has_slug:
         if not is_user_paid(current_user):
             conn.close()
             return jsonify({"error": "Custom URLs are a Pro feature."}), 403
@@ -1393,7 +1473,7 @@ def update_invite_emails(poll_id):
     if access_mode:
         fields.append("access_mode = %s")
         params.append(access_mode)
-    if slug is not None:
+    if has_slug:
         fields.append("slug = %s")
         params.append(slug or None)
     params.append(poll_id)
@@ -1421,6 +1501,41 @@ def view_poll_by_slug(slug):
     return redirect(url_for("view_poll", poll_id=row["id"]))
 
 
+def load_vote_state(cursor, poll_id):
+    cursor.execute("SELECT * FROM dates WHERE poll_id = %s ORDER BY date", (poll_id,))
+    dates = cursor.fetchall()
+
+    cursor.execute(
+        '''SELECT v.date_id, v.user_email, v.status
+           FROM votes v JOIN dates d ON d.id = v.date_id
+           WHERE d.poll_id = %s''',
+        (poll_id,)
+    )
+    all_votes = cursor.fetchall()
+
+    votes_dict = {date["id"]: {} for date in dates}
+    participants = set()
+    yes_counts = {date["id"]: 0 for date in dates}
+    possible_dates = []
+
+    for v in all_votes:
+        votes_dict.setdefault(v["date_id"], {})[v["user_email"]] = v["status"]
+        if v["status"] == "yes":
+            yes_counts[v["date_id"]] = yes_counts.get(v["date_id"], 0) + 1
+        participants.add(v["user_email"])
+
+    for date in dates:
+        statuses = set(votes_dict.get(date["id"], {}).values())
+        if statuses and "no" not in statuses:
+            possible_dates.append(date["id"])
+
+    max_yes = max(yes_counts.values()) if yes_counts else 0
+    best_dates = [d_id for d_id, count in yes_counts.items() if count == max_yes and max_yes > 0]
+
+    return dict(dates=dates, votes_dict=votes_dict, participants=sorted(participants),
+                best_dates=best_dates, possible_dates=possible_dates)
+
+
 @app.route("/poll/<poll_id>")
 def view_poll(poll_id):
     current_user = get_current_user()
@@ -1443,36 +1558,13 @@ def view_poll(poll_id):
         flash("This poll is invite-only and you're not on the list.", "error")
         return redirect(url_for("dashboard"))
 
-    cursor.execute("SELECT * FROM dates WHERE poll_id = %s ORDER BY date", (poll_id,))
-    dates = cursor.fetchall()
-
-    cursor.execute(
-        '''SELECT v.date_id, v.user_email, v.status
-           FROM votes v JOIN dates d ON d.id = v.date_id
-           WHERE d.poll_id = %s''',
-        (poll_id,)
-    )
-    all_votes = cursor.fetchall()
+    vote_state = load_vote_state(cursor, poll_id)
     conn.close()
-
-    votes_dict = {date["id"]: {} for date in dates}
-    participants = set()
-    yes_counts = {date["id"]: 0 for date in dates}
-    possible_dates = []
-
-    for v in all_votes:
-        votes_dict.setdefault(v["date_id"], {})[v["user_email"]] = v["status"]
-        if v["status"] == "yes":
-            yes_counts[v["date_id"]] = yes_counts.get(v["date_id"], 0) + 1
-        participants.add(v["user_email"])
-
-    for date in dates:
-        statuses = set(votes_dict.get(date["id"], {}).values())
-        if statuses and "no" not in statuses:
-            possible_dates.append(date["id"])
-
-    max_yes = max(yes_counts.values()) if yes_counts else 0
-    best_dates = [d_id for d_id, count in yes_counts.items() if count == max_yes and max_yes > 0]
+    dates = vote_state["dates"]
+    votes_dict = vote_state["votes_dict"]
+    participants = vote_state["participants"]
+    best_dates = vote_state["best_dates"]
+    possible_dates = vote_state["possible_dates"]
 
     poll["can_manage"] = user_can_manage_poll(current_user, poll)
     is_closed = bool(poll.get("closed_at"))
@@ -1548,7 +1640,7 @@ def poll_access(poll_id):
         conn.commit()
         conn.close()
 
-        sent, error = send_magic_link_email(email, token, poll, request.url_root)
+        sent, error = send_magic_link_email(email, token, poll)
         if sent:
             flash(f"Check your inbox — we've sent a sign-in link to {email}.", "success")
         else:
@@ -1588,14 +1680,23 @@ def magic_login(token):
     email = normalize_email(link["email"])
     poll_id = link["poll_id"]
 
-    if link["used_at"] is None:
-        cursor.execute("UPDATE magic_links SET used_at = NOW() WHERE id = %s", (link["id"],))
-
-    cursor.execute("SELECT id FROM users WHERE LOWER(email) = %s", (email,))
+    # Match the user-before-token lock order of email confirmation. Recheck the
+    # token after waiting: a confirmed email change may have invalidated it.
+    cursor.execute("SELECT id FROM users WHERE LOWER(email) = %s FOR UPDATE", (email,))
+    user = cursor.fetchone()
+    cursor.execute('''UPDATE magic_links SET used_at = COALESCE(used_at, NOW())
+                      WHERE id = %s AND expires_at > NOW()
+                        AND (used_at IS NULL OR used_at > NOW() - INTERVAL '60 seconds')
+                      RETURNING id''', (link["id"],))
     if not cursor.fetchone():
+        conn.close()
+        flash("This sign-in link is no longer valid. Please request a new one.", "error")
+        return redirect(url_for("login"))
+    if not user:
         cursor.execute(
-            "INSERT INTO users (email, role, tier, is_verified) VALUES (%s, %s, %s, TRUE)",
-            (email, default_role_for_email(email), default_tier_for_email(email))
+            '''INSERT INTO users (email, role, tier, is_verified, is_approved) VALUES (%s, %s, %s, TRUE, %s)
+               ON CONFLICT (email) DO UPDATE SET is_verified = TRUE''',
+            (email, default_role_for_email(email), default_tier_for_email(email), is_allowed_email(email))
         )
     else:
         cursor.execute("UPDATE users SET is_verified = TRUE WHERE LOWER(email) = %s", (email,))
@@ -1675,7 +1776,7 @@ def close_poll(poll_id):
 
     conn = get_db()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
-    cursor.execute("SELECT * FROM polls WHERE id = %s", (poll_id,))
+    cursor.execute("SELECT * FROM polls WHERE id = %s FOR UPDATE", (poll_id,))
     poll = cursor.fetchone()
     if not poll:
         conn.close()
@@ -1725,6 +1826,16 @@ def reopen_poll(poll_id):
         flash("Only the poll organizer can reopen this poll.", "error")
         return redirect(url_for("view_poll", poll_id=poll_id))
 
+    limit_reached = active_poll_limit_reached(cursor, poll["admin_email"])
+    cursor.execute("SELECT closed_at FROM polls WHERE id = %s FOR UPDATE", (poll_id,))
+    current_poll = cursor.fetchone()
+    if not current_poll or not current_poll["closed_at"]:
+        conn.close()
+        return redirect(url_for("view_poll", poll_id=poll_id))
+    if limit_reached:
+        conn.close()
+        flash("Free tier allows 1 active poll at a time. Close or delete the other poll before reopening this one, or upgrade to Pro.", "error")
+        return redirect(url_for("view_poll", poll_id=poll_id))
     cursor.execute("UPDATE dates SET is_final = FALSE WHERE poll_id = %s", (poll_id,))
     cursor.execute("UPDATE polls SET closed_at = NULL, closed_by = NULL WHERE id = %s", (poll_id,))
     conn.commit()
@@ -1812,6 +1923,10 @@ def set_poll_event_time(poll_id):
         "start_time": poll.get("event_start_time"),
         "end_time": poll.get("event_end_time"),
         "ai_prompt": ai_prompt,
+        "calendar_events": [
+            {"id": d["id"], "label": event_time_label(poll, d), **build_calendar_deeplinks(poll, d, attendees)}
+            for d in updated_finals
+        ],
     })
 
 
@@ -1876,7 +1991,7 @@ def submit_vote(poll_id):
     conn = get_db()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
 
-    cursor.execute("SELECT * FROM polls WHERE id = %s", (poll_id,))
+    cursor.execute("SELECT * FROM polls WHERE id = %s FOR UPDATE", (poll_id,))
     poll = cursor.fetchone()
     if not poll:
         conn.close()
@@ -1914,9 +2029,13 @@ def submit_vote(poll_id):
             )
 
     conn.commit()
+    vote_state = load_vote_state(cursor, poll_id)
     conn.close()
-
-    return jsonify({"success": True, "date_removed": False})
+    return jsonify({
+        "success": True,
+        "date_rows_html": render_template("_date_rows.html", user_email=current_user["email"], **vote_state),
+        "participants_html": render_template("_participants.html", user_email=current_user["email"], **vote_state),
+    })
 
 
 @app.route("/dashboard")
@@ -1953,7 +2072,7 @@ def dashboard():
         visible_polls.append(poll)
 
     owned_poll_count = get_owned_poll_count(current_user["email"])
-    can_create_poll = not (current_user["tier"] == "free" and owned_poll_count >= FREE_POLL_LIMIT)
+    can_create_poll = can_create_polls(current_user) and not (current_user["tier"] == "free" and owned_poll_count >= FREE_POLL_LIMIT)
 
     return render_template(
         "dashboard.html",
@@ -1967,6 +2086,7 @@ def dashboard():
 
 
 @app.route("/upgrade")
+@organizer_required
 def upgrade():
     current_user = get_current_user()
     if not current_user:
@@ -1996,11 +2116,12 @@ def admin_panel():
             u.role,
             u.tier,
             u.is_verified,
+            u.is_approved,
             u.created_at,
             COUNT(p.id) AS owned_poll_count
         FROM users u
         LEFT JOIN polls p ON LOWER(p.admin_email) = LOWER(u.email)
-        GROUP BY u.email, u.display_name, u.role, u.tier, u.is_verified, u.created_at
+        GROUP BY u.email, u.display_name, u.role, u.tier, u.is_verified, u.is_approved, u.created_at
         ORDER BY u.created_at ASC
         '''
     )
@@ -2021,6 +2142,8 @@ def admin_panel():
         "SELECT * FROM account_requests ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END, created_at DESC"
     )
     account_requests = cursor.fetchall()
+    cursor.execute("SELECT * FROM contact_messages ORDER BY created_at DESC LIMIT 100")
+    contact_messages = cursor.fetchall()
     conn.close()
 
     for poll in polls:
@@ -2038,6 +2161,7 @@ def admin_panel():
         users=users,
         polls=polls,
         account_requests=account_requests,
+        contact_messages=contact_messages,
         pending_count=pending_count,
         mail_status=mail_status,
         mailersend_key_masked=mailersend_key_masked,
@@ -2056,6 +2180,7 @@ def admin_update_user(target_email):
     role = (request.form.get("role") or "").strip().lower()
     tier = (request.form.get("tier") or "").strip().lower()
     is_verified = request.form.get("is_verified") == "on"
+    is_approved = request.form.get("is_approved") == "on"
 
     if role not in VALID_ROLES or tier not in VALID_TIERS:
         flash("Invalid role or tier selection.", "error")
@@ -2064,11 +2189,13 @@ def admin_update_user(target_email):
     if role == "admin":
         tier = "paid"
         is_verified = True
+        is_approved = True
 
     if target_email in ADMIN_EMAILS:
         role = "admin"
         tier = "paid"
         is_verified = True
+        is_approved = True
 
     conn = get_db()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
@@ -2084,8 +2211,8 @@ def admin_update_user(target_email):
             return redirect(url_for("admin_panel"))
 
     cursor.execute(
-        "UPDATE users SET role = %s, tier = %s, is_verified = %s WHERE LOWER(email) = %s",
-        (role, tier, is_verified, target_email)
+        "UPDATE users SET role = %s, tier = %s, is_verified = %s, is_approved = %s WHERE LOWER(email) = %s",
+        (role, tier, is_verified, is_approved, target_email)
     )
     if cursor.rowcount == 0:
         conn.close()
@@ -2141,7 +2268,7 @@ def admin_send_magic_link(target_email):
     cursor.execute("SELECT id FROM users WHERE LOWER(email) = %s", (email,))
     if not cursor.fetchone():
         cursor.execute(
-            "INSERT INTO users (email, role, tier, is_verified) VALUES (%s, %s, %s, FALSE)",
+            "INSERT INTO users (email, role, tier, is_verified, is_approved) VALUES (%s, %s, %s, FALSE, TRUE)",
             (email, default_role_for_email(email), default_tier_for_email(email))
         )
 
@@ -2157,7 +2284,7 @@ def admin_send_magic_link(target_email):
     conn.commit()
     conn.close()
 
-    sent, error = send_magic_link_email(email, token, poll, request.url_root)
+    sent, error = send_magic_link_email(email, token, poll)
     if sent:
         flash(f"Sign-in link sent to {email}.", "success")
     else:
@@ -2205,7 +2332,8 @@ def admin_test_email():
 
 @app.route("/request-account", methods=["GET", "POST"])
 def request_account():
-    if session.get("user_email"):
+    current_user = get_current_user()
+    if can_create_polls(current_user):
         return redirect(url_for("dashboard"))
 
     if request.method == "POST":
@@ -2232,7 +2360,7 @@ def request_account():
         cursor = conn.cursor(cursor_factory=RealDictCursor)
 
         # Check if already an approved user
-        cursor.execute("SELECT id FROM users WHERE LOWER(email) = %s AND is_verified = TRUE", (email,))
+        cursor.execute("SELECT id FROM users WHERE LOWER(email) = %s AND is_approved = TRUE", (email,))
         if cursor.fetchone():
             conn.close()
             flash("An account with this email already exists. Please log in.", "success")
@@ -2256,12 +2384,12 @@ def request_account():
         conn.commit()
         conn.close()
 
-        send_admin_request_notification(email, name, reason, approval_token, request.url_root)
+        send_admin_request_notification(email, name, reason, approval_token)
 
         flash("Your request has been submitted! You'll receive an email once an admin approves your account.", "success")
         return redirect(url_for("request_account"))
 
-    prefill_email = normalize_email(request.args.get("email", ""))
+    prefill_email = normalize_email(request.args.get("email", current_user["email"] if current_user else ""))
     requested_poll = None
     poll_id_arg = request.args.get("poll", "").strip()
     if poll_id_arg:
@@ -2306,11 +2434,11 @@ def approve_request_via_email(token):
     cursor.execute("SELECT id FROM users WHERE LOWER(email) = %s", (email,))
     if not cursor.fetchone():
         cursor.execute(
-            "INSERT INTO users (email, display_name, role, tier, is_verified) VALUES (%s, %s, %s, %s, TRUE)",
+            "INSERT INTO users (email, display_name, role, tier, is_verified, is_approved) VALUES (%s, %s, %s, %s, TRUE, TRUE)",
             (email, req.get("name"), default_role_for_email(email), default_tier_for_email(email))
         )
     else:
-        cursor.execute("UPDATE users SET is_verified = TRUE WHERE LOWER(email) = %s", (email,))
+        cursor.execute("UPDATE users SET is_verified = TRUE, is_approved = TRUE WHERE LOWER(email) = %s", (email,))
 
     magic_token = generate_token()
     cursor.execute(
@@ -2320,7 +2448,7 @@ def approve_request_via_email(token):
     conn.commit()
     conn.close()
 
-    sent, error = send_magic_link_email(email, magic_token, None, request.url_root)
+    sent, error = send_magic_link_email(email, magic_token, None)
 
     if sent:
         flash(f"Account request for {email} approved. They've been sent a one-click sign-in link.", "success")
@@ -2358,11 +2486,11 @@ def admin_approve_request(request_id):
     cursor.execute("SELECT id FROM users WHERE LOWER(email) = %s", (email,))
     if not cursor.fetchone():
         cursor.execute(
-            "INSERT INTO users (email, display_name, role, tier, is_verified) VALUES (%s, %s, %s, %s, TRUE)",
+            "INSERT INTO users (email, display_name, role, tier, is_verified, is_approved) VALUES (%s, %s, %s, %s, TRUE, TRUE)",
             (email, req.get("name"), default_role_for_email(email), default_tier_for_email(email))
         )
     else:
-        cursor.execute("UPDATE users SET is_verified = TRUE WHERE LOWER(email) = %s", (email,))
+        cursor.execute("UPDATE users SET is_verified = TRUE, is_approved = TRUE WHERE LOWER(email) = %s", (email,))
 
     magic_token = generate_token()
     cursor.execute(
@@ -2372,7 +2500,7 @@ def admin_approve_request(request_id):
     conn.commit()
     conn.close()
 
-    sent, error = send_magic_link_email(email, magic_token, None, request.url_root)
+    sent, error = send_magic_link_email(email, magic_token, None)
 
     if sent:
         flash(f"Approved! Sign-in link sent to {email}.", "success")
@@ -2409,7 +2537,8 @@ def admin_reject_request(request_id):
 
 @app.route("/profile", methods=["GET", "POST"])
 def profile():
-    user_email = session.get("user_email")
+    current_user = get_current_user()
+    user_email = current_user["email"] if current_user else None
     
     if not user_email:
         flash("Please log in first", "error")
@@ -2429,14 +2558,9 @@ def profile():
             flash("Profile picture must be an http(s) URL.", "error")
             return redirect(url_for("profile"))
 
-        if not new_email:
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", new_email):
             conn.close()
-            flash("Email is required", "error")
-            return redirect(url_for("profile"))
-
-        if not is_allowed_email(new_email) and new_email != current_email:
-            conn.close()
-            flash("That email is not associated with an approved account.", "error")
+            flash("Please enter a valid email address.", "error")
             return redirect(url_for("profile"))
 
         if new_email != current_email:
@@ -2452,46 +2576,36 @@ def profile():
             token = generate_token()
 
             cursor.execute(
-                '''
-                UPDATE users
-                SET email = %s, display_name = %s, profile_picture = %s, is_verified = FALSE
-                WHERE LOWER(email) = %s
-                ''',
-                (
-                    new_email,
-                    display_name if display_name else None,
-                    profile_picture if profile_picture else None,
-                    current_email
-                )
+                "UPDATE users SET display_name = %s, profile_picture = %s WHERE id = %s",
+                (display_name or None, profile_picture or None, current_user["id"])
             )
+            cursor.execute("DELETE FROM email_changes WHERE expires_at < NOW()")
             cursor.execute(
-                "UPDATE polls SET admin_email = %s WHERE LOWER(admin_email) = %s",
-                (new_email, current_email)
-            )
-            cursor.execute(
-                "UPDATE votes SET user_email = %s WHERE LOWER(user_email) = %s",
-                (new_email, current_email)
-            )
-            cursor.execute(
-                "INSERT INTO magic_links (email, token, poll_id, expires_at) VALUES (%s, %s, NULL, NOW() + INTERVAL '24 hours')",
-                (new_email, token)
+                '''INSERT INTO email_changes (user_id, new_email, token, expires_at)
+                   VALUES (%s, %s, %s, NOW() + INTERVAL '24 hours')
+                   ON CONFLICT (user_id) DO UPDATE SET new_email = EXCLUDED.new_email,
+                       token = EXCLUDED.token, expires_at = EXCLUDED.expires_at''',
+                (current_user["id"], new_email, token)
             )
             conn.commit()
             conn.close()
 
-            sent, error = send_magic_link_email(new_email, token, None, request.url_root)
-            session.pop("user_email", None)
-            session.pop("poll_name", None)
-            session.pop("poll_creator_email", None)
-
+            verify_url = public_url("confirm_email_change", token=token)
+            sent, error = send_email(new_email, "Confirm your new Templo email", f'''
+                <h2>Confirm your new email address</h2>
+                <p><a href="{verify_url}">Confirm email change</a></p>
+                <p>This link expires in 24 hours. Your current email stays active until you confirm.</p>
+            ''')
             if sent:
-                flash("Email updated. Check your new inbox for a sign-in link.", "success")
+                flash("Check your new inbox to confirm the change. Your current email stays active until then.", "success")
             else:
-                code, msg = classify_email_error(error)
-                flash(f"Email updated, but we couldn't send a sign-in link ({code}). {msg} Try signing in.", "error")
-                if error:
-                    print(f"ERROR: Magic-link send failed for new email {new_email}: {error}")
-            return redirect(url_for("login"))
+                conn = get_db()
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM email_changes WHERE token = %s", (token,))
+                conn.commit()
+                conn.close()
+                flash("We couldn't send the confirmation email. Your email address is unchanged. Please try again later.", "error")
+            return redirect(url_for("profile"))
 
         cursor.execute(
             "UPDATE users SET display_name = %s, profile_picture = %s WHERE LOWER(email) = %s",
@@ -2507,17 +2621,78 @@ def profile():
     
     cursor.execute("SELECT email, display_name, profile_picture FROM users WHERE email = %s", (normalize_email(user_email),))
     user = cursor.fetchone()
+    cursor.execute("SELECT new_email FROM email_changes WHERE user_id = %s AND expires_at > NOW()", (current_user["id"],))
+    pending_change = cursor.fetchone()
     conn.close()
     
     normalized_email = normalize_email(user_email)
     default_name = EMAIL_TO_NAME.get(normalized_email, normalized_email.split('@')[0])
     
-    return render_template("profile.html", user=user, default_name=default_name)
+    return render_template("profile.html", user=user, default_name=default_name,
+                           pending_email=pending_change["new_email"] if pending_change else None)
+
+
+@app.route("/confirm-email/<token>")
+def confirm_email_change(token):
+    conn = get_db()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute('''
+        SELECT ec.*, u.email AS old_email FROM email_changes ec
+        JOIN users u ON u.id = ec.user_id
+        WHERE ec.token = %s AND ec.expires_at > NOW() FOR UPDATE OF u
+    ''', (token,))
+    change = cursor.fetchone()
+    if change:
+        old_email = change["old_email"]
+        cursor.execute("SELECT * FROM email_changes WHERE token = %s AND expires_at > NOW() FOR UPDATE", (token,))
+        change = cursor.fetchone()
+        if change:
+            change["old_email"] = old_email
+    if not change:
+        conn.close()
+        flash("This email confirmation link has expired or already been used.", "error")
+        return redirect(url_for("profile" if get_current_user() else "login"))
+
+    old_email, new_email = normalize_email(change["old_email"]), change["new_email"]
+    cursor.execute("SELECT id FROM users WHERE LOWER(email) = %s AND id != %s", (new_email, change["user_id"]))
+    if cursor.fetchone():
+        conn.close()
+        flash("That email is already in use. Your current email is unchanged.", "error")
+        return redirect(url_for("profile" if get_current_user() else "login"))
+
+    try:
+        cursor.execute("UPDATE users SET email = %s, is_verified = TRUE WHERE id = %s", (new_email, change["user_id"]))
+        cursor.execute("UPDATE polls SET admin_email = %s WHERE LOWER(admin_email) = %s", (new_email, old_email))
+        cursor.execute("UPDATE polls SET closed_by = %s WHERE LOWER(closed_by) = %s", (new_email, old_email))
+        cursor.execute("UPDATE votes SET user_email = %s WHERE LOWER(user_email) = %s", (new_email, old_email))
+        cursor.execute("SELECT id, invite_emails FROM polls WHERE invite_emails IS NOT NULL")
+        for poll in cursor.fetchall():
+            invited = set(parse_invite_emails(poll["invite_emails"]))
+            if old_email in invited:
+                invited.remove(old_email)
+                invited.add(new_email)
+                cursor.execute("UPDATE polls SET invite_emails = %s WHERE id = %s", (serialize_invite_emails(invited), poll["id"]))
+        cursor.execute("DELETE FROM magic_links WHERE LOWER(email) = %s", (old_email,))
+        cursor.execute("DELETE FROM verification_tokens WHERE LOWER(email) = %s", (old_email,))
+        cursor.execute("DELETE FROM email_changes WHERE user_id = %s", (change["user_id"],))
+        conn.commit()
+    except psycopg2.IntegrityError:
+        conn.rollback()
+        conn.close()
+        flash("That email is already in use. Your current email is unchanged.", "error")
+        return redirect(url_for("profile" if get_current_user() else "login"))
+    conn.close()
+    session.clear()
+    session.permanent = True
+    session["user_email"] = new_email
+    flash("Email address confirmed and updated.", "success")
+    return redirect(url_for("dashboard"))
 
 
 @app.route("/profile/upload-photo", methods=["POST"])
 def upload_profile_photo():
-    user_email = session.get("user_email")
+    current_user = get_current_user()
+    user_email = current_user["email"] if current_user else None
     
     if not user_email:
         return jsonify({"error": "Not logged in"}), 401
@@ -2550,7 +2725,7 @@ def upload_profile_photo():
         with open(output_path, "wb") as out_file:
             out_file.write(file_data)
 
-        photo_url = url_for("static", filename=f"{UPLOAD_URL_PREFIX}/{saved_filename}", _external=True)
+        photo_url = public_url("static", filename=f"{UPLOAD_URL_PREFIX}/{saved_filename}")
         
         conn = get_db()
         cursor = conn.cursor()
@@ -2625,6 +2800,14 @@ def marketing_contact():
             <hr>
             <p style="color: #6b7280; font-size: 14px;">Sent from the Templo contact form at templobooker.com</p>
         """
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute('''INSERT INTO contact_messages (name, email, subject, message)
+                          VALUES (%s, %s, %s, %s) RETURNING id''', (name, email, subject, message))
+        message_id = cursor.fetchone()[0]
+        conn.commit()
+        conn.close()
+        delivered = False
         for admin_email in ADMIN_EMAILS:
             sent, error = send_email(
                 admin_email,
@@ -2634,8 +2817,17 @@ def marketing_contact():
             )
             if not sent:
                 print(f"ERROR: Failed to send contact form email to {admin_email}: {error}")
+            delivered = delivered or sent
 
-        flash("Message sent! We'll get back to you soon.", "success")
+        if delivered:
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute("UPDATE contact_messages SET delivered_at = NOW() WHERE id = %s", (message_id,))
+            conn.commit()
+            conn.close()
+            flash("Message sent! We'll get back to you soon.", "success")
+        else:
+            flash("Your message has been saved. Email notifications are temporarily unavailable.", "error")
         return redirect(url_for("marketing_contact"))
 
     return render_template(

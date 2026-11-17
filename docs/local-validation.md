@@ -15,4 +15,5 @@ before merging. Do not bypass a required status check: report it for a separate 
 Use Python 3.11+ (prefer the repository's .python-version), uv and Docker.
 The script creates a fresh Postgres 16 container bound only to localhost:55432,
 matching smoke_test.py. An occupied port is an error; never reuse an existing DB.
-It disables dotenv loading and runs uv sync --locked followed by the smoke test.
+It disables dotenv loading and runs uv sync --locked followed by the smoke test
+and regression suite.

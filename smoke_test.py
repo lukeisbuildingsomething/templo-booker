@@ -7,7 +7,8 @@ import os
 import re
 
 os.environ["SESSION_SECRET"] = "test-secret"
-os.environ["DATABASE_URL"] = "postgresql://postgres:test@localhost:55432/templo"
+os.environ["DATABASE_URL"] = "postgresql://postgres:test@127.0.0.1:55432/templo"
+os.environ["PUBLIC_BASE_URL"] = "http://127.0.0.1:8080"
 os.environ["SESSION_COOKIE_SECURE"] = "0"
 os.environ["ADMIN_EMAILS"] = "admin@example.com"
 
@@ -153,10 +154,9 @@ check("admin panel", c.get("/admin").status_code == 200)
 r = c.post("/profile", data={"display_name": "Admin", "email": "admin@example.com", "profile_picture": "javascript:alert(1)"}, follow_redirects=True)
 check("reject javascript: picture", b"must be an http(s) URL" in r.data)
 
-# Contact form: a genuine message (no timing token) flows through validation
-# and the send path (which fails gracefully without an API key) → success.
+# A genuine message is persisted even without configured email delivery.
 r = c.post("/contact", data={"name": "Bob", "email": "bob@example.com", "subject": "hi", "message": "hello"}, follow_redirects=True)
-check("contact form (genuine message delivered)", r.status_code == 200)
+check("contact form (delivery failure honestly reported)", r.status_code == 200 and b"Your message has been saved" in r.data and b"Message sent!" not in r.data)
 # Honeypot-filled submission is silently accepted (bot) — still 200, never errors.
 r = c.post("/contact", data={"name": "Bot", "email": "bot@example.com", "message": "spam", "website": "http://spam.example"}, follow_redirects=True)
 check("contact form (honeypot silently accepted)", r.status_code == 200)

@@ -14,6 +14,8 @@
             <a href="/create" class="bg-indigo-600 text-white py-2 px-4 rounded-lg font-medium hover:bg-indigo-700 transition-colors">
                 Create New Poll
             </a>
+            {% elif not can_organize %}
+            <a href="/request-account" class="bg-indigo-600 text-white py-2 px-4 rounded-lg font-medium hover:bg-indigo-700">Request Organizer Access</a>
             {% else %}
             <a href="/upgrade" class="bg-amber-600 text-white py-2 px-4 rounded-lg font-medium hover:bg-amber-700 transition-colors">
                 Upgrade to Create More
@@ -22,7 +24,9 @@
         </div>
     </div>
 
-    {% if current_user and current_user.tier == 'free' %}
+    {% if not can_organize %}
+    <p class="mb-6 p-4 rounded-lg bg-indigo-50 text-sm text-indigo-900">You're signed in to vote. Request organizer access to create your own polls.</p>
+    {% elif current_user and current_user.tier == 'free' %}
     <div class="mb-6 p-4 rounded-lg bg-amber-50 border border-amber-200">
         <p class="text-sm text-amber-800 font-medium">Free Tier Usage</p>
         <p class="text-xs text-amber-700 mt-1">Active polls: {{ owned_poll_count }} / {{ free_poll_limit }}. Date limit per poll: {{ free_date_limit }}.</p>
@@ -116,7 +120,7 @@
             </svg>
         </div>
         <h3 class="text-lg font-medium text-gray-900 mb-2">No polls available</h3>
-        <p class="text-gray-600 mb-6">Create your first poll or wait until someone invites you.</p>
+        <p class="text-gray-600 mb-6">{% if can_organize %}Create your first poll or wait until someone invites you.{% else %}Open a poll link to vote, or request organizer access to create your own polls.{% endif %}</p>
         {% if can_create_poll %}
         <a 
             href="/create"
@@ -124,6 +128,8 @@
         >
             Create a Poll
         </a>
+        {% elif not can_organize %}
+        <a href="/request-account" class="inline-block bg-indigo-600 text-white py-3 px-6 rounded-lg font-medium hover:bg-indigo-700">Request Organizer Access</a>
         {% else %}
         <a 
             href="/upgrade"

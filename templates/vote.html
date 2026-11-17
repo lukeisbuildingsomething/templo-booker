@@ -123,7 +123,7 @@
 
                 <div class="space-y-3">
                     {% for d in final_dates %}
-                    <div class="border border-emerald-200 rounded-lg p-3 bg-white">
+                    <div class="border border-emerald-200 rounded-lg p-3 bg-white" data-event-date-id="{{ d.id }}">
                         <div class="flex items-center justify-between gap-3 flex-wrap">
                             <div>
                                 <div class="font-medium text-gray-900">{{ d.date }}</div>
@@ -135,6 +135,7 @@
                                 {% if poll.can_manage and d.google_url %}
                                 <a
                                     href="{{ d.google_url }}"
+                                    data-calendar-provider="google"
                                     target="_blank"
                                     rel="noopener"
                                     class="text-xs bg-emerald-600 text-white py-2 px-3 rounded-lg hover:bg-emerald-700 transition-colors inline-flex items-center gap-1"
@@ -144,6 +145,7 @@
                                 </a>
                                 <a
                                     href="{{ d.outlook_url }}"
+                                    data-calendar-provider="outlook"
                                     target="_blank"
                                     rel="noopener"
                                     class="text-xs bg-blue-600 text-white py-2 px-3 rounded-lg hover:bg-blue-700 transition-colors inline-flex items-center gap-1"
@@ -265,98 +267,11 @@
             {% endif %}
             
             <div id="dates-container" class="space-y-3">
-                {% for date in dates %}
-                {% set date_votes = votes_dict.get(date.id, {}) %}
-                {% set yes_count = date_votes.values()|select('equalto', 'yes')|list|length %}
-                {% set current_vote = date_votes.get(user_email, '') if user_email else '' %}
-                <div class="date-row border rounded-lg p-4 {% if date.is_final %}border-emerald-400 bg-emerald-50 ring-1 ring-emerald-300{% elif date.id in best_dates %}border-green-300 bg-green-50{% else %}border-gray-200{% endif %}" data-date-id="{{ date.id }}" data-date="{{ date.date }}" data-votes="{{ yes_count }}" data-is-best="{{ 'true' if date.id in best_dates else 'false' }}" data-is-possible="{{ 'true' if date.id in possible_dates else 'false' }}">
-                    <div class="flex items-center justify-between gap-4">
-                        <label class="close-checkbox hidden flex-shrink-0 cursor-pointer">
-                            <input type="checkbox" name="final_date" value="{{ date.id }}" class="w-5 h-5 rounded text-emerald-600" onchange="updateCloseBar()">
-                        </label>
-                        <div class="flex-1">
-                            <div class="flex items-center gap-2 flex-wrap">
-                                <span class="font-medium text-gray-900">{{ date.date }}</span>
-                                {% if date.is_final %}
-                                <span class="text-xs bg-emerald-600 text-white px-2 py-0.5 rounded-full">Confirmed</span>
-                                {% elif date.id in best_dates %}
-                                <span class="text-xs bg-green-500 text-white px-2 py-0.5 rounded-full">Best</span>
-                                {% endif %}
-                            </div>
-                            <div class="flex items-center gap-1 mt-2">
-                                {% for participant in participants %}
-                                {% set vote = date_votes.get(participant) %}
-                                <div 
-                                    class="w-6 h-6 rounded-full flex items-center justify-center text-xs font-medium text-white cursor-default {% if vote == 'yes' %}bg-green-500{% elif vote == 'no' %}bg-red-500{% elif vote == 'maybe' %}bg-amber-400{% else %}bg-gray-300{% endif %}"
-                                    title="{{ get_name(participant) }}{% if vote %}: {{ vote }}{% endif %}"
-                                >
-                                    {{ get_name(participant)[0]|upper }}
-                                </div>
-                                {% endfor %}
-                                {% if participants|length == 0 %}
-                                <span class="text-sm text-gray-400">No votes yet</span>
-                                {% endif %}
-                            </div>
-                        </div>
-                        
-                        <div class="vote-buttons hidden flex-shrink-0" data-current="{{ current_vote }}">
-                            <div class="flex gap-1">
-                                <button 
-                                    onclick="vote({{ date.id }}, 'yes', this)"
-                                    class="w-10 h-10 rounded-lg font-medium text-sm transition-all {{ 'bg-green-500 text-white ring-2 ring-green-600' if current_vote == 'yes' else 'bg-gray-100 text-gray-600 hover:bg-green-100' }}"
-                                    data-status="yes"
-                                >
-                                    Y
-                                </button>
-                                <button 
-                                    onclick="vote({{ date.id }}, 'maybe', this)"
-                                    class="w-10 h-10 rounded-lg font-medium text-sm transition-all {{ 'bg-amber-400 text-white ring-2 ring-amber-500' if current_vote == 'maybe' else 'bg-gray-100 text-gray-600 hover:bg-amber-100' }}"
-                                    data-status="maybe"
-                                >
-                                    ?
-                                </button>
-                                <button 
-                                    onclick="vote({{ date.id }}, 'no', this)"
-                                    class="w-10 h-10 rounded-lg font-medium text-sm transition-all {{ 'bg-red-500 text-white ring-2 ring-red-600' if current_vote == 'no' else 'bg-gray-100 text-gray-600 hover:bg-red-100' }}"
-                                    data-status="no"
-                                >
-                                    N
-                                </button>
-                            </div>
-                        </div>
-                        
-                        <div class="your-vote flex-shrink-0">
-                            {% if current_vote == 'yes' %}
-                            <div class="w-8 h-8 rounded-full bg-green-500 flex items-center justify-center text-white text-sm font-medium">Y</div>
-                            {% elif current_vote == 'no' %}
-                            <div class="w-8 h-8 rounded-full bg-red-500 flex items-center justify-center text-white text-sm font-medium">N</div>
-                            {% elif current_vote == 'maybe' %}
-                            <div class="w-8 h-8 rounded-full bg-amber-400 flex items-center justify-center text-white text-sm font-medium">?</div>
-                            {% elif user_email %}
-                            <div class="w-8 h-8 rounded-full bg-gray-200 flex items-center justify-center text-gray-400 text-sm">-</div>
-                            {% endif %}
-                        </div>
-                    </div>
-                </div>
-                {% endfor %}
+                {% include "_date_rows.html" %}
             </div>
             </div>
 
-            {% if participants|length > 0 %}
-            <div class="mt-6 pt-4 border-t border-gray-100">
-                <h3 class="text-xs font-medium text-gray-500 uppercase tracking-wide mb-2">Participants</h3>
-                <div class="flex flex-wrap gap-2">
-                    {% for participant in participants %}
-                    <span class="text-sm text-gray-600 bg-gray-100 px-3 py-1 rounded-full">
-                        {{ get_name(participant) }}
-                        {% if participant == user_email %}
-                        <span class="text-indigo-600">(you)</span>
-                        {% endif %}
-                    </span>
-                    {% endfor %}
-                </div>
-            </div>
-            {% endif %}
+            <div id="participants-panel">{% include "_participants.html" %}</div>
         </div>
     </div>
 </div>
@@ -439,7 +354,11 @@
         rows.forEach(row => container.appendChild(row));
     }
     
+    let votePending = false;
     async function vote(dateId, status, button) {
+        if (votePending) return;
+        votePending = true;
+        document.querySelectorAll('.vote-buttons button, #editBtn, #startCloseBtn').forEach(btn => { btn.disabled = true; });
         try {
             const response = await fetch('/poll/{{ poll.id }}/vote', {
                 method: 'POST',
@@ -464,49 +383,21 @@
                 return;
             }
             
-            if (data.date_removed) {
-                const row = button.closest('.date-row');
-                row.style.transition = 'opacity 0.3s, transform 0.3s';
-                row.style.opacity = '0';
-                row.style.transform = 'translateX(-20px)';
-                setTimeout(() => row.remove(), 300);
-                return;
-            }
-            
-            const container = button.parentElement;
-            container.querySelectorAll('button').forEach(btn => {
-                btn.classList.remove('bg-green-500', 'bg-red-500', 'bg-amber-400', 'text-white', 'ring-2', 'ring-green-600', 'ring-red-600', 'ring-amber-500');
-                btn.classList.add('bg-gray-100', 'text-gray-600');
-            });
-            
-            button.classList.remove('bg-gray-100', 'text-gray-600');
-            if (status === 'yes') {
-                button.classList.add('bg-green-500', 'text-white', 'ring-2', 'ring-green-600');
-            } else if (status === 'no') {
-                button.classList.add('bg-red-500', 'text-white', 'ring-2', 'ring-red-600');
-            } else {
-                button.classList.add('bg-amber-400', 'text-white', 'ring-2', 'ring-amber-500');
-            }
-            
-            const row = button.closest('.date-row');
-            const yourVote = row.querySelector('.your-vote');
-            yourVote.innerHTML = getVoteIndicator(status);
-            
+            if (!response.ok) throw new Error('Vote failed');
+            document.getElementById('dates-container').innerHTML = data.date_rows_html;
+            document.getElementById('participants-panel').innerHTML = data.participants_html;
+            document.querySelectorAll('.vote-buttons').forEach(el => el.classList.toggle('hidden', !editMode));
+            document.querySelectorAll('.your-vote').forEach(el => el.classList.toggle('hidden', editMode));
+            filterDates(currentFilter);
+            sortDates(currentSort);
         } catch (error) {
             alert('An error occurred. Please try again.');
+        } finally {
+            votePending = false;
+            document.querySelectorAll('.vote-buttons button, #editBtn, #startCloseBtn').forEach(btn => { btn.disabled = false; });
         }
     }
     
-    function getVoteIndicator(status) {
-        if (status === 'yes') {
-            return '<div class="w-8 h-8 rounded-full bg-green-500 flex items-center justify-center text-white text-sm font-medium">Y</div>';
-        } else if (status === 'no') {
-            return '<div class="w-8 h-8 rounded-full bg-red-500 flex items-center justify-center text-white text-sm font-medium">N</div>';
-        } else {
-            return '<div class="w-8 h-8 rounded-full bg-amber-400 flex items-center justify-center text-white text-sm font-medium">?</div>';
-        }
-    }
-
     function enterCloseMode() {
         document.querySelectorAll('.close-checkbox').forEach(el => el.classList.remove('hidden'));
         document.getElementById('close-action-bar').classList.remove('hidden');
@@ -608,6 +499,7 @@
         const start = document.getElementById('masterStartTime').value;
         const end = document.getElementById('masterEndTime').value;
         const status = document.getElementById('masterTimeStatus');
+        document.querySelectorAll('#event-time-master input').forEach(el => { el.disabled = true; });
         status.textContent = 'Saving…';
         status.className = 'text-xs text-gray-400 ml-auto';
 
@@ -631,7 +523,15 @@
             const labelText = allDay
                 ? 'All-day event'
                 : `${data.start_time}–${data.end_time} (${tz})`;
-            document.querySelectorAll('.event-label').forEach(el => { el.textContent = labelText; });
+            for (const event of data.calendar_events) {
+                const card = document.querySelector(`[data-event-date-id="${event.id}"]`);
+                if (!card) continue;
+                card.querySelector('.event-label').textContent = labelText;
+                const google = card.querySelector('[data-calendar-provider="google"]');
+                const outlook = card.querySelector('[data-calendar-provider="outlook"]');
+                if (google) google.href = event.google_url;
+                if (outlook) outlook.href = event.outlook_url;
+            }
             const aiEl = document.getElementById('ai-prompt-text');
             if (aiEl && data.ai_prompt) aiEl.textContent = data.ai_prompt;
             status.textContent = 'Saved';
@@ -640,6 +540,8 @@
         } catch (e) {
             status.textContent = 'Network error';
             status.className = 'text-xs text-red-600 ml-auto';
+        } finally {
+            document.querySelectorAll('#event-time-master input').forEach(el => { el.disabled = false; });
         }
     }
 </script>

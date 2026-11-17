@@ -13,3 +13,4 @@ done
 [[ "$ready" == 1 ]] || { echo 'Postgres did not become ready' >&2; exit 1; }
 uv sync --locked
 uv run python smoke_test.py
+uv run python regression_test.py

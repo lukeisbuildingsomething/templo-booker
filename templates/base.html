@@ -45,11 +45,17 @@
                 <div class="flex items-center space-x-4 text-sm">
                     {% if current_user %}
                         <a href="/dashboard" class="text-gray-600 hover:text-gray-900">My Polls</a>
+                        {% if can_organize %}
                         <a href="/create" class="text-gray-600 hover:text-gray-900">Create</a>
+                        {% else %}
+                        <a href="/request-account" class="text-gray-600 hover:text-gray-900">Request organizer access</a>
+                        {% endif %}
                         {% if is_admin %}
                         <a href="/admin" class="text-gray-600 hover:text-gray-900 relative">Admin{% if pending_request_count > 0 %}<span class="ml-1 inline-flex items-center justify-center px-1.5 py-0.5 rounded-full text-xs font-bold bg-red-500 text-white">{{ pending_request_count }}</span>{% endif %}</a>
                         {% endif %}
-                        {% if current_user.tier == 'free' %}
+                        {% if not can_organize %}
+                        <span class="px-2 py-1 rounded-full text-xs font-semibold bg-gray-100 text-gray-700">Voter</span>
+                        {% elif current_user.tier == 'free' %}
                         <a href="/upgrade" class="text-amber-700 hover:text-amber-800 font-medium">Upgrade</a>
                         <span class="px-2 py-1 rounded-full text-xs font-semibold bg-amber-100 text-amber-700">Free</span>
                         {% else %}

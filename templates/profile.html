@@ -55,7 +55,10 @@
                     required
                     class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
                 >
-                <p class="text-xs text-gray-500 mt-1">If you change your email, you’ll need to verify the new address before signing in again.</p>
+                <p class="text-xs text-gray-500 mt-1">Your current address stays active until you confirm the new email address.</p>
+                {% if pending_email %}
+                <p class="text-sm text-indigo-700 mt-2">Confirmation pending for {{ pending_email }}. Check that inbox to finish the change.</p>
+                {% endif %}
             </div>
 
             <div>
